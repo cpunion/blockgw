@@ -9,7 +9,7 @@ rand_file "$W/m/big.bin" $((96 << 20)); gen_tree "$W/m/tree" 800 18
 hb=$(file_hash "$W/m/big.bin"); ht=$(tree_hash "$W/m/tree")
 umount_ok "$W/m"; drain "$cfg" "$id"
 src=$(file_hash "$(image a 0)")
-HYDRATE_MBPS=0 DISK_KEYS="a-d0" r=$(write_config r 1 2)   # on demand only
+r=$(HYDRATE_MBPS=0 DISK_KEYS="a-d0" write_config r 1 2)   # on demand only
 t0=$(now_ms); start_server "$r"; rid=$(cfg_ids "$r")
 log "metric: lazy restore served the device after $(( $(now_ms) - t0 )) ms: $(last_start_log "$r" | grep -oE 'lazy restore.*')"
 a0=$(ctl "$r" stats json | python3 -c "import json,sys;print(json.load(sys.stdin)['disks'][0]['absent_blocks'])")

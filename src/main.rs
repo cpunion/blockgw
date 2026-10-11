@@ -12,6 +12,7 @@
 //!   FLUSH -> fdatasync data file -> seal open segment -> policy wait (remote: uploaded; local: lag <= max_lag)
 //!   DISCARD / WRITE_ZEROES -> punch hole -> record in open segment
 
+mod crypt;
 mod dev;
 mod extmap;
 mod failpoint;
@@ -120,6 +121,9 @@ fn load_config(path: &str) -> Result<Config> {
             d.id
         );
         anyhow::ensure!(d.policy == "local" || d.policy == "remote", "device {}: policy must be local or remote", d.id);
+        if let Some(k) = &d.key_file {
+            crypt::load_key(k).with_context(|| format!("device {}", d.id))?;
+        }
     }
     Ok(cfg)
 }
@@ -135,8 +139,8 @@ fn worker(path: &str) -> Result<()> {
     };
     let pool = dev::Pool::new();
     for i in 0..cfg.upload_workers.unwrap_or(16) {
-        let (p, s) = (pool.clone(), s3.clone());
-        std::thread::Builder::new().name(format!("put-{i}")).spawn(move || p.worker(s.as_ref()))?;
+        let p = pool.clone();
+        std::thread::Builder::new().name(format!("put-{i}")).spawn(move || p.worker())?;
     }
     let fetch = FETCH.get_or_init(dev::FetchPool::new).clone();
     for i in 0..8 {
@@ -146,7 +150,11 @@ fn worker(path: &str) -> Result<()> {
     let mut devs = Vec::new();
     for dc in cfg.devices.clone() {
         failpoint::hit("open")?;
-        let d = Arc::new(Dev::open(dc, s3.clone())?);
+        let store: Arc<dyn store::Store> = match &dc.key_file {
+            Some(k) => Arc::new(crypt::CryptStore::new(s3.clone(), &crypt::load_key(k)?)),
+            None => s3.clone(),
+        };
+        let d = Arc::new(Dev::open(dc, store)?);
         let (d2, p2) = (d.clone(), pool.clone());
         std::thread::Builder::new().name(format!("disp-{}", d.cfg.id)).spawn(move || d2.dispatcher(&p2))?;
         d.recover()?; // before attach: the crashed run's un-uploaded tail goes first

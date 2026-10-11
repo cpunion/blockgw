@@ -6,7 +6,7 @@ id=$(cfg_ids "$cfg")
 mkfs_mount "$id" "$W/m"
 gen_tree "$W/m/before" 500 5; sync -f "$W/m"; drain "$cfg" "$id"
 hb=$(tree_hash "$W/m/before")
-DISK_KEYS="a-d0" r=$(write_config r 1 4)
+r=$(DISK_KEYS="a-d0" write_config r 1 4)
 start_server "$r"
 # old writer keeps writing; with the local policy fsync succeeds locally, the upload then collides
 gen_tree "$W/m/after" 200 6; sync -f "$W/m" 2>/dev/null; sleep 2

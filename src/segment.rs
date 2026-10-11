@@ -145,6 +145,7 @@ pub fn encode(epoch: u64, seq: u64, b: &Builder) -> Vec<u8> {
 
 /// Length of header + meta, from the header alone (so a reader knows how much to fetch).
 pub fn meta_end(header: &[u8]) -> Result<usize> {
+    ensure!(!crate::crypt::looks_encrypted(header), "the object is encrypted, but this disk has no key_file");
     ensure!(header.len() >= HEADER && &header[0..4] == MAGIC, "not a v2 segment (bad magic or short header)");
     Ok(HEADER + u32::from_le_bytes(header[32..36].try_into()?) as usize)
 }

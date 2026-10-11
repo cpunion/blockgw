@@ -33,6 +33,7 @@ CI runs the unit layer and the end-to-end suite on every pull request
 | `src/logx.rs` | RFC 3339 UTC timestamps (including a leap day and 2099), level parsing and ordering |
 | `src/failpoint.rs` | failpoint spec parsing; malformed entries ignored |
 | `src/gc.rs` | deletion only of unreferenced data segments below the older checkpoint (tombstones and newer segments kept); keeping the last two checkpoints; repack candidates by live ratio, age and budget |
+| `src/crypt.rs` | stored size ↔ plaintext size for chunk-boundary sizes; ranged reads at chunk boundaries, past the end, with and without a cached header, equal the plaintext; listings report plaintext sizes; stored bytes are ciphertext; a wrong key, an object moved to another key, a flipped bit, swapped chunks, truncation and a plaintext object all fail; key file formats and the permission check |
 | `src/presence.rs` | presence bitmap round trip (padding bits ignored); a fetch never lands on a block being written or already written; a failed write leaves the block absent; next-absent scan across words |
 | `src/track.rs` | a region needs persisting on first write only; bits clear only after the last write's segment is committed and nothing is in flight; failed writes do not pin a region; overlapping writes keep the latest segment; bitmap round trip (padding bits ignored); commit of out-of-order completions only as a contiguous prefix |
 
@@ -68,6 +69,7 @@ CI runs the unit layer and the end-to-end suite on every pull request
 | `16_checkpoint_restore` | 20 overwrites of the same 8 MiB: drain writes a checkpoint; a restore uses it and fetches about 8 MiB of live data out of about 160 MiB uploaded; image identical |
 | `17_gc` | three rounds of overwrites, each followed by `ctl gc`: GC deletes dead segments; segments left in the store = uploaded − deleted; a restore after GC is byte-identical |
 | `18_lazy_restore` | a lazy restore serves the device at once with >20,000 blocks absent; a read-only mount reads the small files on demand (identical tree) while the big file stays absent; the big file is read across a worker kill; the whole device equals the source; with hydration on, nothing is left absent, the presence file goes away and the image file equals the source |
+| `19_encryption` | with `key_file`, no object in the store contains a plaintext marker or a segment/checkpoint header; a fresh host with the key restores the tree; a wrong key and no key both fail to open the disk with a clear error; `check-config` refuses a world-readable key file |
 
 Failpoints (`src/failpoint.rs`) let a case make the server fail at a named place:
 
@@ -82,8 +84,10 @@ Writing a case:
 - The file is sourced with `tests/e2e/lib.sh` loaded. Use `write_config`, `start_server`,
   `kill9_worker` (the supervisor restarts it), `kill9_all`, `ctl`, `stat`, `mkfs_mount`, `gen_tree`, `tree_hash`, `assert_eq` and friends.
 - Exit 0 to pass, 77 (`skip`) to skip; anything else fails the case.
-- Set `DISK_KEYS=a-d0` before `write_config` to address an existing disk from a second server, as a
-  restore or takeover does.
+- Pass `DISK_KEYS=a-d0` to `write_config` to address an existing disk from a second server, as a
+  restore or takeover does: `r=$(DISK_KEYS=a-d0 write_config r 1 2)`. Other per-disk settings come
+  the same way (`CKPT_EVERY`, `LAZY`, `HYDRATE_MBPS`, `KEY_FILE`). Put them inside `$(...)`:
+  `VAR=x r=$(write_config ...)` would set `VAR` for the rest of the case.
 
 Running locally without root on the host, for example on macOS with OrbStack or Docker Desktop:
 
@@ -125,8 +129,9 @@ Checks:
 3. **Under `remote`**, K covers every write acknowledged by an fsync that returned before the copy
    started.
 
-On failure it prints the seed; rerun with `--seed N --policy P` to reproduce. CI runs 90 s per
-policy, with the run id as seed, so every run explores a different schedule.
+On failure it prints the seed; rerun with `--seed N --policy P` to reproduce. `--encrypt` runs the
+same test on an encrypted disk. CI runs 90 s per policy, plus `remote` with `--encrypt`, with the
+run id as seed, so every run explores a different schedule.
 
 This test drove one design fix. Crash-recovery re-uploads used to be split into 16 MiB segments; a
 host lost halfway through that upload would leave a prefix mixing crash-time and older regions.

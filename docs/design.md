@@ -302,6 +302,43 @@ hydration to completion.
 - The dirty set after a crash therefore tracks the un-uploaded tail, not everything written since
   the disk was last idle.
 
+### 3.6a Encryption at rest
+
+With `key_file` set, every object of the disk (segments, checkpoints, epoch markers, tombstones) is
+sealed by a store wrapper before it leaves the host, so the log format above is unchanged and
+compression still runs before encryption.
+
+```text
+object: "BGE1" | nonce prefix (16 random bytes) | plaintext length u64 | chunk 0 | chunk 1 | ...
+chunk i: XChaCha20-Poly1305 of plaintext bytes [i * 64 KiB, (i + 1) * 64 KiB), plus a 16-byte tag
+  nonce = nonce prefix | i;  associated data = object key | the 28-byte header
+```
+
+- **Ranged reads still work.** A read fetches whole 64 KiB chunks around the requested range.
+  Each object's header is cached after its first read, and segment reads start with the meta at
+  offset 0, so encryption adds no request. Overhead: 28 bytes per object plus 16 bytes per 64 KiB.
+- **Nonces never repeat**: the 128-bit random prefix is drawn per object, and the chunk index makes
+  it unique within it. Nonces do not depend on the key name, so an upload retried with different
+  content (after a crash) cannot reuse a nonce.
+- **Integrity and binding.** The object key and the header are authenticated. An object copied
+  to another key (another log position, or another disk), chunks reordered, a truncated object or
+  one sealed under another key all fail to decrypt.
+- **Fail closed.** A disk with a key refuses objects that are not encrypted: an attacker who can
+  write to the bucket cannot inject plaintext segments. A disk without a key reports "the object is
+  encrypted, but this disk has no key_file" instead of misreading it. Either way, opening fails
+  before the device is attached.
+- **Key handling**: 32 bytes per disk, read from a file (64 hex digits or raw) that must not be
+  accessible by group or others. One key may serve several disks; the key name in the associated
+  data keeps their objects apart. Losing the key loses the disk. Rotation is not implemented: the
+  key of an existing disk cannot change.
+- Listings report plaintext sizes, so size-based checks (tombstone detection) are unchanged.
+- **Not hidden**: object names, sizes and timing (how much and when a disk writes) remain visible
+  to the store. The local image on the host is not encrypted by blockgw (use dm-crypt or an
+  encrypted host disk).
+
+The torture test runs in CI with `--encrypt` as well (remote policy), and e2e case
+`19_encryption` checks that no plaintext reaches the store and that wrong or missing keys fail.
+
 ### 3.7 Failure semantics
 
 | Failure | What the consumer sees | Handling |
@@ -312,6 +349,7 @@ hydration to completion.
 | `SIGTERM` | nothing; the devices stay recoverable | The worker drains every disk's upload queue (bounded at 60 s per disk), then exits |
 | Object store unavailable | `local`: none until the lag exceeds `max_lag`, then writers wait. `remote`: `fsync` blocks | Uploads retry with backoff up to 5 s; errors are logged |
 | Fenced by a newer writer | `EIO` on every I/O | `FENCED` log line; the disk must be given up |
+| Wrong, missing or unexpected key | the disk is not attached | opening fails with a decryption or "no key_file" error; nothing is served |
 | Local image or intent file lost | disk unusable on this host | Restore on any host from the log; under `local`, the un-uploaded tail is lost |
 | Host lost | — | Another host opens the disk; under `local`, up to `max_lag` of tail is lost |
 
@@ -349,8 +387,8 @@ hydration to completion.
 
 1. A bounded local cache: lazy restore fetches on first read and hydrates in the background, but
    a host still ends up holding the full image; evicting cold, uploaded blocks is not done.
-2. Encryption at rest.
-3. Standby replication of unflushed writes.
+2. Standby replication of unflushed writes.
+3. Key rotation for encrypted disks.
 
 ## 7. Alternatives considered
 

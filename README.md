@@ -14,10 +14,10 @@ Its history is a strictly ordered log of segments uploaded to S3, R2, or any S3-
 You can restore a disk on any host from the log alone, and a second host that opens the disk fences
 out the first.
 
-> **Status: experimental prototype.** The write path, crash recovery and supervision, checkpointed
-> restore, garbage collection and fencing work and are covered by tests. Cold reads that fetch data
-> lazily from S3, and encryption, are not implemented yet. Do not use it for data you cannot afford to lose. See
-> [Roadmap](#roadmap).
+> **Status: experimental.** The write path, crash recovery and supervision, checkpointed and lazy
+> restore, garbage collection, fencing and encryption at rest work and are covered by tests. A host
+> still ends up holding each disk's full image (no bounded cache yet), and there is no standby
+> replication. Do not use it for data you cannot afford to lose. See [Roadmap](#roadmap).
 
 ## Why
 
@@ -169,8 +169,8 @@ See [docs/testing.md](docs/testing.md).
 
 ## Roadmap
 
-1. Encryption at rest (per-disk keys, per frame).
-2. Optional streaming of unflushed writes to a standby.
+1. Optional streaming of unflushed writes to a standby.
+2. Key rotation for encrypted disks.
 3. Bounded local cache: evict cold, already-uploaded blocks so a host keeps only a working set
    (lazy restore already fetches blocks on first read).
 4. Zero-copy ublk (Linux 6.15+); concurrent-writer and filesystem-level (fsstress) torture.

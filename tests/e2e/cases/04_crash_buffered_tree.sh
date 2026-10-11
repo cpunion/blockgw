@@ -14,6 +14,6 @@ wait $cp_pid
 assert_eq "$(cat "$W/cp.rc")" 0 "copy + sync exit status"
 assert_eq "$(tree_hash "$W/m/copy")" "$h" "tree after crash"
 umount_ok "$W/m"; drain "$cfg" "$id"
-DISK_KEYS="a-d0" r=$(write_config r 1 4)
+r=$(DISK_KEYS="a-d0" write_config r 1 4)
 start_server "$r"
 assert_eq "$(dev_hash "$(cfg_ids "$r")")" "$(file_hash "$(image a 0)")" "object store converged"

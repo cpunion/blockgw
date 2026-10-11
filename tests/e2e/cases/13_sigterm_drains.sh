@@ -15,6 +15,6 @@ for _ in $(seq 1 600); do kill -0 "$sup" 2>/dev/null || break; sleep 0.1; done
 kill -0 "$sup" 2>/dev/null && fail "service did not exit after SIGTERM"
 grep -q "drained to seq" "${cfg%.json}.log" || fail "no drain on shutdown"
 unset BLOCKGW_FAILPOINTS
-DISK_KEYS="a-d0" r=$(write_config r 1 4)
+r=$(DISK_KEYS="a-d0" write_config r 1 4)
 start_server "$r"
 assert_eq "$(dev_hash "$(cfg_ids "$r")")" "$(file_hash "$(image a 0)")" "object store holds everything after SIGTERM"
