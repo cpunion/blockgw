@@ -1,0 +1,16 @@
+{
+  "s3": {
+    "endpoint": "https://s3.us-west-2.amazonaws.com",
+    "region": "us-west-2",
+    "bucket": "my-blockgw-bucket",
+    "access_key": "AKIA...",
+    "secret_key": "...",
+    "path_style": false
+  },
+  "control_socket": "/run/blockgw.sock",
+  "upload_workers": 16,
+  "devices": [
+    { "id": 0, "size_gb": 20, "dir": "/var/lib/blockgw/disk0", "prefix": "disks/disk0", "policy": "local", "max_lag_mb": 16 },
+    { "id": 1, "size_gb": 20, "dir": "/var/lib/blockgw/disk1", "prefix": "disks/disk1", "policy": "remote" }
+  ]
+}

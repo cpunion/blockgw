@@ -1,0 +1,28 @@
+[package]
+name = "blockgw"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+description = "Virtual block devices for Linux (ublk) that live on local disk and persist as a log of segments in S3-compatible object storage"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/dastai/blockgw"
+readme = "README.md"
+keywords = ["ublk", "block-device", "s3", "io_uring", "storage"]
+categories = ["filesystem", "command-line-utilities"]
+publish = false
+
+[dependencies]
+libublk = "=0.4.8"
+io-uring = "0.7.12"
+smol = "2"
+libc = "0.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+zstd = "0.13"
+rusty-s3 = "0.10"
+ureq = "2"
+url = "2"
+anyhow = "1"
+
+[profile.release]
+debug = 1
