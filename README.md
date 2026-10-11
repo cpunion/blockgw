@@ -156,13 +156,16 @@ On macOS or Windows, run blockgw in a Linux VM; see [docs/local-dev.md](docs/loc
 
 - `cargo test`: unit tests for the segment format, replay and fencing rules, write-intent tracking
   and in-order commit.
-- `sudo tests/e2e/run.sh`: seventeen end-to-end cases against real ublk devices, with a local
+- `sudo tests/e2e/run.sh`: nineteen end-to-end cases against real ublk devices, with a local
   SeaweedFS or (`E2E_STORE=dir`) a local-directory store (crash recovery, supervisor restart, orphan
   timeout, graceful drain, restore, fencing, policy switch, discard, multi-disk, idle requests,
-  metrics, checkpoint restore, garbage collection, lazy restore, ...).
+  metrics, checkpoint restore, garbage collection, lazy restore, encryption, ...).
 - `sudo tests/torture/torture.py`: crash-consistency torture. Random worker kills, random upload
-  failures and store copies taken at random instants; every copy must restore to an exact prefix
-  of the writes, with nothing lost that `remote` acknowledged.
+  failures and store copies taken at random instants; with one or more concurrent writers, every
+  copy must be crash-consistent (happens-before closed), with nothing lost that `remote`
+  acknowledged.
+- `sudo tests/torture/fstorture.py`: the same faults under XFS with a file workload; every copy must
+  mount and pass `xfs_repair -n`, and under `remote` every fsynced file must be intact.
 - `bench/bench.sh`: the benchmark behind the numbers above.
 
 See [docs/testing.md](docs/testing.md).
@@ -173,7 +176,7 @@ See [docs/testing.md](docs/testing.md).
 2. Key rotation for encrypted disks.
 3. Bounded local cache: evict cold, already-uploaded blocks so a host keeps only a working set
    (lazy restore already fetches blocks on first read).
-4. Zero-copy ublk (Linux 6.15+); concurrent-writer and filesystem-level (fsstress) torture.
+4. Zero-copy ublk (Linux 6.15+); fencing races under torture; long-running soak tests.
 5. Native macOS and Windows frontends (research: an iSCSI target for Windows' built-in initiator;
    an FSKit-served image file attached with `hdiutil` on macOS).
 

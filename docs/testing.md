@@ -24,10 +24,10 @@ CI runs the unit layer and the end-to-end suite on every pull request
 
 | Module | Tests cover |
 |---|---|
-| `src/log.rs` | key encoding (numeric order) for segments, epochs and checkpoints; tombstone detection; contiguous-prefix rule; fence targets covering gaps and the in-flight window |
-| `src/segment.rs` | v2 round trip with compressible and incompressible frames; 200 random ranged reads match the data stream; discard-only segments; detection of meta checksum, frame checksum, truncated meta or frames, and bad magic |
+| `src/log.rs` | key encoding (numeric order) for segments, epochs and checkpoints; tombstone detection; contiguous-prefix rule; fence targets covering gaps and the in-flight window, but not GC holes below the epoch's checkpoint; sealed = highest object is a tombstone |
+| `src/segment.rs` | v3 round trip including the `committed` attestation; v2 objects still read; round trip with compressible and incompressible frames; 200 random ranged reads match the data stream; discard-only segments; detection of meta checksum, frame checksum, truncated meta or frames, and bad magic |
 | `src/extmap.rs` | map follows the latest location and holes (overwrite, discard); runs; checkpoint round trip, including a disk-size mismatch and a truncated checkpoint; fetch plan groups by segment in data order |
-| `src/restore.rs` | a log with a checkpoint, later segments, a tombstone and junk past it: full restore and map-only rebuild both equal a straight replay; plan without a checkpoint stops each epoch at its first gap; foreign-data detection |
+| `src/restore.rs` | a log with a checkpoint, later segments, a tombstone and junk past it: full restore and map-only rebuild both equal a straight replay; plan without a checkpoint ends each epoch at its tombstone; a missing segment mid-epoch, a lost epoch start without a checkpoint and a checkpoint whose epoch vanished all fail the plan ("log incomplete"); foreign-data detection |
 | `src/store.rs` | local-directory store: create-only PUT with exactly one winner among 16 concurrent creators, no temporary files left behind, sorted prefix listing (including a partial last component), rejection of keys that would escape the root |
 | `src/metrics.rs` | Prometheus exposition: HELP/TYPE per family, one sample per disk, every sample line parses; JSON snapshot round trip |
 | `src/logx.rs` | RFC 3339 UTC timestamps (including a leap day and 2099), level parsing and ordering |
@@ -70,6 +70,7 @@ CI runs the unit layer and the end-to-end suite on every pull request
 | `17_gc` | three rounds of overwrites, each followed by `ctl gc`: GC deletes dead segments; segments left in the store = uploaded − deleted; a restore after GC is byte-identical |
 | `18_lazy_restore` | a lazy restore serves the device at once with >20,000 blocks absent; a read-only mount reads the small files on demand (identical tree) while the big file stays absent; the big file is read across a worker kill; the whole device equals the source; with hydration on, nothing is left absent, the presence file goes away and the image file equals the source |
 | `19_encryption` | with `key_file`, no object in the store contains a plaintext marker or a segment/checkpoint header; a fresh host with the key restores the tree; a wrong key and no key both fail to open the disk with a clear error; `check-config` refuses a world-readable key file |
+| `20_missing_segment` | (dir store) a committed segment in the middle of the log is deleted: a restore fails with "log incomplete" naming it instead of serving a partial disk; with the segment back, the restore works |
 
 Failpoints (`src/failpoint.rs`) let a case make the server fail at a named place:
 
@@ -106,36 +107,86 @@ example inside a `rust` container.
 
 `tests/torture/torture.py` drives a blockgw device with a local-directory store.
 
-- **Workload**: a single writer issues O_DIRECT 4 KiB writes to random blocks of a 64 MiB working
-  set, one at a time, with an fsync after about 5% of them. Every block carries
-  `(block, global write id, crc32)`.
+- **Workload**: writer threads (`--threads`, default 1) issue O_DIRECT 4 KiB writes to random
+  blocks of a 64 MiB working set. Each thread owns its own blocks and has one write in flight;
+  after about 5% of its writes it calls fsync. Every block carries `(block, global write id, crc32)`,
+  and the test records when each write was issued and when it completed.
 - **Faults injected meanwhile**:
   - the worker is `SIGKILL`ed every 0.5–2 s; the supervisor restarts it;
   - 10% of uploads fail (`upload=error%10`) and are retried;
   - every 1–3 s the store directory is copied. Objects are only created (immutable) or deleted by
     GC, so the copy lists the checkpoints first, then copies the segments (skipping any GC deletes
-    meanwhile), then only the checkpoints it listed. The result is a state the store really passed
-    through.
+    meanwhile), then only the checkpoints it listed. GC deletes checkpoints before segments, so if
+    the newest listed checkpoint still exists afterwards, nothing the copy needs was deleted;
+    otherwise the copy starts over. The result is a state the store really passed through.
   - checkpoints are taken every 8 segments, so GC deletes and repacks throughout (about 135 rounds
     per 60 s run).
 
 Checks:
 
 1. **No write is lost across worker crashes**: the device ends with the last version of every block.
-2. **Every copy restores to a crash-consistent image**, with no torn block. Because writes are
-   issued one at a time, the restored image must equal the state after exactly the first K writes,
-   for some K. The copy is read through the restored device, so lazy on-demand fetching is part
-   of every check.
-3. **Under `remote`**, K covers every write acknowledged by an fsync that returned before the copy
-   started.
+2. **Every copy restores to a crash-consistent image**, with no torn block. The copy is read
+   through the restored device, so lazy on-demand fetching is part of every check.
+   - *Happens-before*: if the copy holds write W, it holds every write that completed before W was
+     issued (or a later write to the same block). Issue times are taken before the syscall and
+     completion times after it, so the check can only be too lenient, never raise a false alarm.
+   - With one thread, writes are totally ordered and the check tightens to: the image equals the
+     state after exactly the first K writes, for some K.
+3. **Under `remote`**, the copy holds every write that completed before the start of an fsync that
+   returned before the copy started.
 
 On failure it prints the seed; rerun with `--seed N --policy P` to reproduce. `--encrypt` runs the
-same test on an encrypted disk. CI runs 90 s per policy, plus `remote` with `--encrypt`, with the
-run id as seed, so every run explores a different schedule.
+same test on an encrypted disk.
 
-This test drove one design fix. Crash-recovery re-uploads used to be split into 16 MiB segments; a
+This test drove two design fixes. Crash-recovery re-uploads used to be split into 16 MiB segments; a
 host lost halfway through that upload would leave a prefix mixing crash-time and older regions.
-Recovery now uploads one atomic segment.
+Recovery now uploads one atomic segment. The filesystem torture (below) exposed the second: see
+"Fail-closed restore".
+
+## Filesystem torture
+
+`tests/torture/fstorture.py` runs XFS on a blockgw device under the same faults (worker kills,
+upload failures, store copies at random instants). Four threads create files of 0 B–300 KB in
+nested directories, overwrite ranges, truncate, rename and delete them; half of the created files
+are fsynced together with their directory.
+
+XFS relies on flush ordering: data that completed before a flush must be durable before anything
+written after it. blockgw logs writes in arrival order and a copy restores to a prefix of the log,
+so every copy must hold a consistent filesystem, under either policy.
+
+Checks:
+
+1. The live filesystem is clean after the run (`xfs_repair -n` after unmount).
+2. Every copy restores to a filesystem that mounts (replaying its log) and that `xfs_repair -n`
+   then finds clean.
+3. **Under `remote`**: every file whose fsync (file and directory) returned before the copy
+   started, and that was not touched again until the copy ended, is in the copy with its content.
+   A typical copy verifies several hundred to a thousand such files.
+
+**Fail-closed restore.** The first CI run of this test failed: a store copy restored to an XFS
+image with a zeroed log. The copy had been taken while two checkpoints were written and GC
+deleted the old ones with their segments, leaving segments but no checkpoint. Restore then
+replayed the later epochs alone and served a corrupt image without complaint. Three changes came
+out of it: GC deletes checkpoints before segments; opening a disk seals every older epoch (which
+also closes a fencing hole after a claim that crashed midway, §3.4 of the design); and restore
+refuses a log that breaks off at a gap ("log incomplete").
+
+The checker was validated against a deliberately wrong setup: a disk configured `local` but checked
+as `remote` fails check 3 within 30 s (fsynced files missing from a copy).
+
+## In CI
+
+Each pull request runs the torture tests for 90 s each, with the run id as seed, so every run
+explores a different schedule:
+
+| Job | Script and options |
+|---|---|
+| local policy | `torture.py --policy local` |
+| remote policy | `torture.py --policy remote` |
+| remote, 4 writers | `torture.py --policy remote --threads 4` |
+| remote, encrypted | `torture.py --policy remote --encrypt` |
+| XFS, local policy | `fstorture.py --policy local` |
+| XFS, remote policy | `fstorture.py --policy remote` |
 
 ## Benchmark
 
@@ -157,8 +208,8 @@ Results land in `$BENCH_DIR/results/bench.tsv`. The October 2026 numbers are in
 
 ## Not covered yet
 
-- Concurrent writers (the torture test is single-writer, queue depth 1, so its prefix check can be
-  exact) and filesystem-level torture (fsstress / xfstests on top of blockgw).
+- xfstests / fsstress on top of blockgw (the filesystem torture uses its own workload; Debian and
+  Ubuntu do not package fsstress).
 - Fencing races under torture (two servers on one disk while faults are injected).
 - Object stores other than SeaweedFS (in CI) and AWS S3 (benchmarks). Aliyun OSS's
   `x-oss-forbid-overwrite` path is untested.

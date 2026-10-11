@@ -92,32 +92,34 @@ jobs:
           path: /tmp/blockgw-e2e
 
   torture:
-    name: torture (${{ matrix.policy }} policy${{ matrix.encrypt && ', encrypted' || '' }})
+    name: torture (${{ matrix.name }})
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
-        policy: [local, remote]
-        encrypt: [false]
         include:
-          - policy: remote
-            encrypt: true
+          - { name: local policy, slug: local, script: torture.py, args: --policy local }
+          - { name: remote policy, slug: remote, script: torture.py, args: --policy remote }
+          - { name: "remote, 4 writers", slug: remote-threads, script: torture.py, args: --policy remote --threads 4 }
+          - { name: "remote, encrypted", slug: remote-encrypted, script: torture.py, args: --policy remote --encrypt }
+          - { name: "XFS, local policy", slug: fs-local, script: fstorture.py, args: --policy local }
+          - { name: "XFS, remote policy", slug: fs-remote, script: fstorture.py, args: --policy remote }
     steps:
       - uses: actions/checkout@v5
       - name: Install dependencies and load ublk
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq clang libclang-dev "linux-modules-extra-$(uname -r)"
+          sudo apt-get install -y -qq clang libclang-dev xfsprogs "linux-modules-extra-$(uname -r)"
           sudo modprobe ublk_drv
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo build --release
       - name: Crash-consistency torture (random worker kills, upload failures, store copies)
-        run: sudo python3 tests/torture/torture.py --blockgw target/release/blockgw --policy ${{ matrix.policy }} --seconds 90 --seed ${{ github.run_id }} ${{ matrix.encrypt && '--encrypt' || '' }}
+        run: sudo python3 tests/torture/${{ matrix.script }} --blockgw target/release/blockgw ${{ matrix.args }} --seconds 90 --seed ${{ github.run_id }} --work /tmp/blockgw-torture
       - name: Upload work dir on failure
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: torture-${{ matrix.policy }}${{ matrix.encrypt && '-encrypted' || '' }}
+          name: torture-${{ matrix.slug }}
           path: /tmp/blockgw-torture/**/*.log

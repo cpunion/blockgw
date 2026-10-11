@@ -1,8 +1,8 @@
-//! Segment format v2: a self-describing object whose data can be read by byte range.
+//! Segment format v3: a self-describing object whose data can be read by byte range.
 //!
 //! ```text
-//! header (40 bytes):
-//!   "BGS2" | epoch u64 | seq u64 | n_entries u32 | n_frames u32 | frame_size u32 | meta_len u32 | crc32(meta) u32
+//! header (48 bytes):
+//!   "BGS3" | epoch u64 | seq u64 | committed u64 | n_entries u32 | n_frames u32 | frame_size u32 | meta_len u32 | crc32(meta) u32
 //! meta (meta_len bytes):
 //!   n_entries × (kind u8, disk_off u64, len u32, data_off u64)       kind 0 = data, 1 = discard
 //!   n_frames  × (obj_off u64, obj_len u32, raw_len u32, codec u8, crc32(raw) u32)
@@ -12,11 +12,19 @@
 //!
 //! Entry offsets and lengths are multiples of the 4 KiB block size; `data_off` is the entry's
 //! position in the data stream. Frame `i` covers data bytes `[i * frame_size, i * frame_size + raw_len)`.
+//!
+//! `committed` attests how far the writer's log was durably committed when this segment was
+//! encoded: every seq below it exists in the store. Sealing an epoch uses it to tell a segment that
+//! was lost from one that was still in flight (see `dev::seal_epochs`).
+//!
+//! v2 ("BGS2") is the same without `committed` (40-byte header); it is still read, as committed 0.
 
 use anyhow::{bail, ensure, Result};
 
-pub const MAGIC: &[u8; 4] = b"BGS2";
-pub const HEADER: usize = 40;
+pub const MAGIC: &[u8; 4] = b"BGS3";
+const MAGIC_V2: &[u8; 4] = b"BGS2";
+pub const HEADER: usize = 48;
+const HEADER_V2: usize = 40;
 const ENTRY: usize = 21;
 const FRAME: usize = 21;
 pub const KIND_DATA: u8 = 0;
@@ -71,6 +79,8 @@ pub struct Frame {
 pub struct Meta {
     pub epoch: u64,
     pub seq: u64,
+    /// the writer's committed count when this segment was encoded (0 for v2)
+    pub committed: u64,
     pub frame_size: u32,
     pub entries: Vec<Entry>,
     pub frames: Vec<Frame>,
@@ -101,7 +111,7 @@ fn compress_frame(raw: &[u8]) -> (u8, Vec<u8>) {
 }
 
 /// Encode a sealed segment as an object.
-pub fn encode(epoch: u64, seq: u64, b: &Builder) -> Vec<u8> {
+pub fn encode(epoch: u64, seq: u64, committed: u64, b: &Builder) -> Vec<u8> {
     let frames_raw: Vec<&[u8]> = b.data.chunks(FRAME_SIZE as usize).collect();
     let packed: Vec<(u8, Vec<u8>, u32, u32)> = frames_raw
         .iter()
@@ -131,6 +141,7 @@ pub fn encode(epoch: u64, seq: u64, b: &Builder) -> Vec<u8> {
     out.extend_from_slice(MAGIC);
     out.extend_from_slice(&epoch.to_le_bytes());
     out.extend_from_slice(&seq.to_le_bytes());
+    out.extend_from_slice(&committed.to_le_bytes());
     out.extend_from_slice(&(b.entries.len() as u32).to_le_bytes());
     out.extend_from_slice(&(packed.len() as u32).to_le_bytes());
     out.extend_from_slice(&FRAME_SIZE.to_le_bytes());
@@ -143,29 +154,47 @@ pub fn encode(epoch: u64, seq: u64, b: &Builder) -> Vec<u8> {
     out
 }
 
+/// Header length for this object's version.
+fn header_len(header: &[u8]) -> Result<usize> {
+    ensure!(!crate::crypt::looks_encrypted(header), "the object is encrypted, but this disk has no key_file");
+    let h = match header.get(0..4) {
+        Some(m) if m == MAGIC => HEADER,
+        Some(m) if m == MAGIC_V2 => HEADER_V2,
+        _ => anyhow::bail!("not a segment (bad magic)"),
+    };
+    ensure!(header.len() >= h, "segment header truncated");
+    Ok(h)
+}
+
 /// Length of header + meta, from the header alone (so a reader knows how much to fetch).
 pub fn meta_end(header: &[u8]) -> Result<usize> {
-    ensure!(!crate::crypt::looks_encrypted(header), "the object is encrypted, but this disk has no key_file");
-    ensure!(header.len() >= HEADER && &header[0..4] == MAGIC, "not a v2 segment (bad magic or short header)");
-    Ok(HEADER + u32::from_le_bytes(header[32..36].try_into()?) as usize)
+    let h = header_len(header)?;
+    Ok(h + u32::from_le_bytes(header[h - 8..h - 4].try_into()?) as usize)
+}
+
+/// The `committed` attestation, from the first `HEADER` bytes (0 for v2).
+pub fn committed(header: &[u8]) -> Result<u64> {
+    Ok(if header_len(header)? == HEADER { u64::from_le_bytes(header[20..28].try_into()?) } else { 0 })
 }
 
 /// Parse header + meta (`buf` must hold at least `meta_end` bytes), validating the meta checksum
 /// and every offset against the object layout.
 pub fn parse_meta(buf: &[u8]) -> Result<Meta> {
+    let h = header_len(buf)?;
     let end = meta_end(buf)?;
     ensure!(buf.len() >= end, "segment meta truncated");
     let u32at = |p: usize| u32::from_le_bytes(buf[p..p + 4].try_into().unwrap());
     let u64at = |p: usize| u64::from_le_bytes(buf[p..p + 8].try_into().unwrap());
-    let (epoch, seq) = (u64at(4), u64at(12));
-    let (n, m, frame_size, meta_len, crc) = (u32at(20) as usize, u32at(24) as usize, u32at(28), u32at(32) as usize, u32at(36));
-    let meta = &buf[HEADER..end];
+    let (epoch, seq, committed) = (u64at(4), u64at(12), committed(buf)?);
+    let c = h - 20; // the five u32 fields end the header
+    let (n, m, frame_size, meta_len, crc) = (u32at(c) as usize, u32at(c + 4) as usize, u32at(c + 8), u32at(c + 12) as usize, u32at(c + 16));
+    let meta = &buf[h..end];
     ensure!(crc32fast::hash(meta) == crc, "segment meta checksum mismatch");
     ensure!(n.checked_mul(ENTRY).and_then(|a| a.checked_add(m * FRAME)) == Some(meta_len), "segment meta length mismatch");
     ensure!(frame_size > 0, "segment frame size is 0");
     let mut entries = Vec::with_capacity(n);
     for i in 0..n {
-        let p = HEADER + i * ENTRY;
+        let p = h + i * ENTRY;
         let e = Entry { kind: buf[p], off: u64at(p + 1), len: u32at(p + 9), data_off: u64at(p + 13) };
         ensure!(e.kind == KIND_DATA || e.kind == KIND_DISCARD, "entry {i}: unknown kind {}", e.kind);
         entries.push(e);
@@ -173,7 +202,7 @@ pub fn parse_meta(buf: &[u8]) -> Result<Meta> {
     let mut frames = Vec::with_capacity(m);
     let mut expect_off = end as u64;
     for i in 0..m {
-        let p = HEADER + n * ENTRY + i * FRAME;
+        let p = h + n * ENTRY + i * FRAME;
         let f = Frame { obj_off: u64at(p), obj_len: u32at(p + 8), raw_len: u32at(p + 12), codec: buf[p + 16], crc: u32at(p + 17) };
         ensure!(f.obj_off == expect_off, "frame {i}: not contiguous");
         ensure!(f.codec <= 1, "frame {i}: unknown codec {}", f.codec);
@@ -181,7 +210,7 @@ pub fn parse_meta(buf: &[u8]) -> Result<Meta> {
         expect_off += f.obj_len as u64;
         frames.push(f);
     }
-    let meta = Meta { epoch, seq, frame_size, entries, frames };
+    let meta = Meta { epoch, seq, committed, frame_size, entries, frames };
     let dlen = meta.data_len();
     for (i, e) in meta.entries.iter().enumerate() {
         if e.kind == KIND_DATA {
@@ -266,9 +295,10 @@ mod tests {
     #[test]
     fn round_trip() {
         let b = sample();
-        let obj = encode(5, 9, &b);
+        let obj = encode(5, 9, 7, &b);
         let (meta, data) = decode_all(&obj).unwrap();
-        assert_eq!((meta.epoch, meta.seq), (5, 9));
+        assert_eq!((meta.epoch, meta.seq, meta.committed), (5, 9, 7));
+        assert_eq!(committed(&obj[..HEADER]).unwrap(), 7);
         assert_eq!(meta.entries, b.entries);
         assert_eq!(data, b.data);
         assert_eq!(meta.frames.len(), b.data.len().div_ceil(FRAME_SIZE as usize));
@@ -279,7 +309,7 @@ mod tests {
     #[test]
     fn ranged_reads_match_the_data_stream() {
         let b = sample();
-        let obj = encode(1, 1, &b);
+        let obj = encode(1, 1, 0, &b);
         let meta = parse_meta(&obj[..meta_end(&obj).unwrap()]).unwrap();
         let mut x = 12345u64;
         for _ in 0..200 {
@@ -293,11 +323,39 @@ mod tests {
         }
     }
 
+    /// A v2 object: the v3 encoding without `committed`, frame offsets 8 bytes earlier.
+    fn as_v2(v3: &[u8]) -> Vec<u8> {
+        let m = parse_meta(v3).unwrap();
+        let mut meta = v3[HEADER..meta_end(v3).unwrap()].to_vec();
+        for i in 0..m.frames.len() {
+            let p = m.entries.len() * ENTRY + i * FRAME;
+            let off = u64::from_le_bytes(meta[p..p + 8].try_into().unwrap()) - 8;
+            meta[p..p + 8].copy_from_slice(&off.to_le_bytes());
+        }
+        let mut out = MAGIC_V2.to_vec();
+        out.extend_from_slice(&v3[4..20]); // epoch, seq
+        out.extend_from_slice(&v3[28..44]); // counts, frame size, meta length
+        out.extend_from_slice(&crc32fast::hash(&meta).to_le_bytes());
+        out.extend_from_slice(&meta);
+        out.extend_from_slice(&v3[meta_end(v3).unwrap()..]);
+        out
+    }
+
+    #[test]
+    fn v2_objects_are_still_read() {
+        let b = sample();
+        let v2 = as_v2(&encode(4, 2, 9, &b));
+        assert_eq!(meta_end(&v2).unwrap(), meta_end(&encode(4, 2, 9, &b)).unwrap() - 8);
+        let (meta, data) = decode_all(&v2).unwrap();
+        assert_eq!((meta.epoch, meta.seq, meta.committed), (4, 2, 0));
+        assert_eq!(data, b.data);
+    }
+
     #[test]
     fn empty_and_discard_only_segments() {
         let mut b = Builder::default();
         b.push_discard(0, 4096);
-        let (meta, data) = decode_all(&encode(1, 0, &b)).unwrap();
+        let (meta, data) = decode_all(&encode(1, 0, 0, &b)).unwrap();
         assert_eq!(meta.entries.len(), 1);
         assert!(meta.frames.is_empty() && data.is_empty());
         assert_eq!(meta.frames_for(0, 10), 0..0);
@@ -305,7 +363,7 @@ mod tests {
 
     #[test]
     fn corruption_is_detected() {
-        let obj = encode(1, 1, &sample());
+        let obj = encode(1, 1, 0, &sample());
         let end = meta_end(&obj).unwrap();
         let mut bad_meta = obj.clone();
         bad_meta[HEADER + 3] ^= 1;

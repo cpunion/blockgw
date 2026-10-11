@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """blockgw crash-consistency torture test (needs root, ublk_drv, a built blockgw).
 
-A single writer issues O_DIRECT 4 KiB writes to random blocks of a blockgw device, one at a time,
-with random fsyncs. Each block it writes carries (block, global write id, checksum). Meanwhile:
+Writer threads (`--threads`, default 1) issue O_DIRECT 4 KiB writes to random blocks of a blockgw
+device, each thread one write at a time to blocks only it owns, with random fsyncs. Each block
+written carries (block, global write id, checksum). Meanwhile:
   * the worker process is killed with SIGKILL at random intervals (the supervisor restarts it),
   * uploads fail at random (failpoint `upload=error%P`; they are retried),
   * the local-directory object store is copied at random moments. A copy is what a host that died
@@ -14,13 +15,16 @@ Checks:
   1. no acknowledged write is lost across worker crashes: the device ends up holding, for every
      block, the last version written;
   2. every store copy restores to a crash-consistent image (read through the restored device, so
-     lazy on-demand fetches are exercised): because writes are issued one at a time, it must equal
-     the state after exactly the first K writes for some K, with no torn block;
-  3. under the `remote` policy, K covers every write acknowledged by an fsync that returned before
-     the copy started.
+     lazy on-demand fetches are exercised), with no torn block:
+     - happens-before: if the copy holds write W, it holds every write that completed before W was
+       issued (or a later write to the same block);
+     - with one thread, writes are totally ordered, so this tightens to: the image equals the state
+       after exactly the first K writes, for some K;
+  3. under the `remote` policy, the copy holds every write that completed before the start of an
+     fsync that returned before the copy started.
 
 Usage: sudo tests/torture/torture.py --blockgw target/release/blockgw [--policy local|remote]
-                                     [--seconds 60] [--seed N] [--id 1500] [--work /tmp/blockgw-torture]
+                                     [--threads 1] [--encrypt] [--seconds 60] [--seed N] [--id 1500] [--work /tmp/blockgw-torture]
 """
 import argparse, json, mmap, os, random, shutil, signal, struct, subprocess, sys, threading, time, zlib
 
@@ -87,10 +91,12 @@ def dev_node(dev_id, timeout=10):
 def copy_store(src, dst):
     """Copy a live store so that the copy is a state the store really passed through.
 
-    Objects are only ever created (immutable) or deleted by GC, and GC only deletes segments that
-    neither of the last two checkpoints references. So: list the checkpoints first, then copy the
-    segments (skipping any that vanish meanwhile), then copy only the checkpoints listed first.
-    A checkpoint written during the copy is left out; it could reference segments the copy missed.
+    Objects are only ever created (immutable) or deleted by GC. GC deletes old checkpoints before
+    segments, so while a checkpoint exists every segment it references exists, and segments after
+    the newest checkpoint are never deleted. So: list the checkpoints, copy the segments (skipping
+    any that vanish meanwhile), then the listed checkpoints. If the newest listed checkpoint still
+    exists afterwards, GC never deleted anything the copy needs; with none listed, there must still
+    be none (no checkpoint, no GC). Otherwise (checkpoints were written during the copy) start over.
     """
     def files(root):
         for dirpath, _, names in os.walk(root):
@@ -106,12 +112,20 @@ def copy_store(src, dst):
         except FileNotFoundError:
             pass  # deleted by GC after the listing
 
-    ckpts = [p for p in files(src) if "/ckpt/" in p]
-    for p in files(src):
-        if "/ckpt/" not in p:
+    for _ in range(20):
+        ckpts = [p for p in files(src) if "/ckpt/" in p]
+        for p in files(src):
+            if "/ckpt/" not in p:
+                cp(p)
+        for p in ckpts:
             cp(p)
-    for p in ckpts:
-        cp(p)
+        newest = max(ckpts, default=None)  # keys are zero-padded: string order is log order
+        if newest is not None and os.path.exists(newest):
+            return
+        if newest is None and not any("/ckpt/" in p for p in files(src)):
+            return  # no checkpoint yet, so no GC either
+        shutil.rmtree(dst)
+    raise RuntimeError("could not take a consistent store copy in 20 attempts")
 
 
 def write_config(path, store, image_dir, dev_id, policy, key_file=None):
@@ -138,13 +152,14 @@ def main():
     ap.add_argument("--work", default="/tmp/blockgw-torture")
     ap.add_argument("--upload-error-pct", type=int, default=10)
     ap.add_argument("--encrypt", action="store_true", help="encrypt the disk (key_file)")
+    ap.add_argument("--threads", type=int, default=1, help="concurrent writer threads")
     a = ap.parse_args()
     blockgw = os.path.abspath(a.blockgw)
     rng = random.Random(a.seed)
-    work = os.path.join(a.work, f"{a.policy}{'-enc' if a.encrypt else ''}-{a.seed}")
+    work = os.path.join(a.work, f"{a.policy}{'-enc' if a.encrypt else ''}-t{a.threads}-{a.seed}")
     shutil.rmtree(work, ignore_errors=True)
     os.makedirs(work)
-    log(f"seed={a.seed} policy={a.policy} encrypt={a.encrypt} seconds={a.seconds} work={work}")
+    log(f"seed={a.seed} policy={a.policy} threads={a.threads} encrypt={a.encrypt} seconds={a.seconds} work={work}")
     key_file = None
     if a.encrypt:
         key_file = os.path.join(work, "disk.key")
@@ -160,10 +175,10 @@ def main():
     try:
         srv.wait_ready(a.id)
         fd = os.open(dev_node(a.id), os.O_RDWR | os.O_DIRECT)
-        buf = mmap.mmap(-1, BS)
-        writes = []          # gid -> block (index gid-1)
-        state = {"acked": 0}  # highest gid covered by a completed fsync
-        snaps = []           # (dir, acked gid when the copy started)
+        writes = []           # index gid-1: [block, t_issue, t_done]
+        wlock = threading.Lock()
+        state = {"cut": 0.0}  # writes done before this instant are covered by a completed fsync
+        snaps = []            # (dir, cut when the copy started)
         stop = threading.Event()
         kills = [0]
 
@@ -179,28 +194,43 @@ def main():
         def snapshotter():
             n = 0
             while not stop.wait(rng.uniform(1.0, 3.0)):
-                acked = state["acked"]
+                cut = state["cut"]
                 dst = os.path.join(work, f"snap{n}")
                 copy_store(store, dst)
-                snaps.append((dst, acked))
+                snaps.append((dst, cut))
                 n += 1
 
         threads = [threading.Thread(target=killer, daemon=True), threading.Thread(target=snapshotter, daemon=True)]
         for t in threads:
             t.start()
         t_end = time.time() + a.seconds
-        while time.time() < t_end:
-            block = rng.randrange(NBLOCKS)
-            gid = len(writes) + 1
-            buf.seek(0)
-            buf.write(block_bytes(block, gid))
-            os.pwrite(fd, buf, block * BS)
-            writes.append(block)
-            if rng.random() < 0.05:
-                os.fsync(fd)
-                state["acked"] = gid
+
+        def writer(i):
+            wr = random.Random(a.seed * 1000 + i)
+            buf = mmap.mmap(-1, BS)
+            while time.time() < t_end:
+                block = wr.randrange(NBLOCKS // a.threads) * a.threads + i  # blocks owned by this thread
+                with wlock:
+                    writes.append([block, time.monotonic(), None])
+                    gid = len(writes)
+                buf.seek(0)
+                buf.write(block_bytes(block, gid))
+                os.pwrite(fd, buf, block * BS)
+                writes[gid - 1][2] = time.monotonic()
+                if wr.random() < 0.05:
+                    t0 = time.monotonic()
+                    os.fsync(fd)
+                    with wlock:
+                        state["cut"] = max(state["cut"], t0)
+
+        wts = [threading.Thread(target=writer, args=(i,)) for i in range(a.threads)]
+        for t in wts:
+            t.start()
+        for t in wts:
+            t.join()
+        t0 = time.monotonic()
         os.fsync(fd)
-        state["acked"] = len(writes)
+        state["cut"] = t0
         stop.set()
         for t in threads:
             t.join()
@@ -208,7 +238,7 @@ def main():
 
         # 1. the device holds the last version of every block
         last = {}
-        for i, b in enumerate(writes):
+        for i, (b, _, _) in enumerate(writes):
             last[b] = i + 1
         dev = b"".join(os.pread(fd, BS * 1024, off) for off in range(0, NBLOCKS * BS, BS * 1024))
         bad = [b for b in range(NBLOCKS) if parse_block(dev[b * BS:(b + 1) * BS], b) != last.get(b, 0)]
@@ -219,8 +249,9 @@ def main():
         os.close(fd)
         subprocess.run([blockgw, "ctl", cfg.replace(".json", ".sock"), "drain", str(a.id)], capture_output=True)
 
-        # 2 + 3. every store copy restores to the state after exactly K writes
-        for k, (snap, acked) in enumerate(snaps):
+        # 2 + 3. every store copy restores to a crash-consistent state
+        by_done = sorted(range(len(writes)), key=lambda g: writes[g][2])  # gid-1 by completion time
+        for k, (snap, cut) in enumerate(snaps):
             rid = a.id + 1 + k
             used_ids.append(rid)
             rcfg = os.path.join(work, f"restore{k}.json")
@@ -237,16 +268,33 @@ def main():
                     os.close(rfd)
                 gids = [parse_block(img[b * BS:(b + 1) * BS], b) for b in range(NBLOCKS)]
                 K = max(gids)
-                expect = {}
-                for i, b in enumerate(writes[:K]):
-                    expect[b] = i + 1
-                wrong = [b for b in range(NBLOCKS) if gids[b] != expect.get(b, 0)]
-                if wrong:
-                    failures.append(f"copy {k}: not the state after the first {K} writes ({len(wrong)} blocks differ, e.g. {wrong[:5]})")
-                elif a.policy == "remote" and K < acked:
-                    failures.append(f"copy {k}: holds {K} writes but {acked} were acknowledged by fsync before the copy (remote policy)")
+                problems = []
+                if a.threads == 1:
+                    expect = {}
+                    for i, (b, _, _) in enumerate(writes[:K]):
+                        expect[b] = i + 1
+                    wrong = [b for b in range(NBLOCKS) if gids[b] != expect.get(b, 0)]
+                    if wrong:
+                        problems.append(f"not the state after the first {K} writes ({len(wrong)} blocks differ, e.g. {wrong[:5]})")
+                # happens-before closure, and the remote fsync guarantee: every write done before
+                # `need` must be held (per block, gids grow with time: one thread owns each block)
+                newest_issue = max((writes[g - 1][1] for g in gids if g), default=0.0)
+                need = max(newest_issue, cut if a.policy == "remote" else 0.0)
+                missing = []
+                for g in by_done:
+                    b, _, done = writes[g]
+                    if done >= need:
+                        break
+                    if gids[b] < g + 1:
+                        missing.append(g + 1)
+                if missing:
+                    why = "acknowledged by an fsync before the copy, or done before a write the copy holds was issued"
+                    problems.append(f"{len(missing)} writes missing that were {why}, e.g. gids {missing[:5]}")
+                if problems:
+                    failures.append(f"copy {k}: " + "; ".join(problems))
                 else:
-                    log(f"copy {k}: crash-consistent prefix of {K} writes (acked before copy: {acked})")
+                    held = sum(1 for g in gids if g)
+                    log(f"copy {k}: crash-consistent ({held} blocks written, newest gid {K})")
             except AssertionError as e:
                 failures.append(f"copy {k}: {e}")
             finally:
