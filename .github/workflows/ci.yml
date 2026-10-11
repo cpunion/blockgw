@@ -1,0 +1,48 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  check:
+    name: fmt, clippy, unit tests
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install build dependencies
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq clang libclang-dev
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo test
+
+  e2e:
+    name: end-to-end (ublk + SeaweedFS)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies and load ublk
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq clang libclang-dev xfsprogs bc "linux-modules-extra-$(uname -r)" || \
+            sudo apt-get install -y -qq clang libclang-dev xfsprogs bc
+          sudo modprobe ublk_drv
+          ls -l /dev/ublk-control
+          uname -r
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release
+      - name: End-to-end suite
+        run: sudo -E env "PATH=$PATH" tests/e2e/run.sh
+      - name: Upload logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-logs
+          path: /tmp/blockgw-e2e
