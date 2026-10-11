@@ -405,8 +405,9 @@ The torture test runs in CI with `--encrypt` as well (remote policy), and e2e ca
 - **Memory**: 15.5 MB for 16 idle disks.
   - Under load it is dominated by I/O buffers (queue depth 32 × 256 KiB per queue), segment buffers
     (up to 16 MiB open plus the queued bytes) and allocator caches.
-  - Run with `MALLOC_ARENA_MAX=2`; without it, glibc kept about 550 MB of per-thread arenas after a
-    5.5 GB write burst.
+  - blockgw limits glibc to two malloc arenas at startup (`mallopt(M_ARENA_MAX, 2)`). Without
+    that, glibc kept about 550 MB of per-thread arenas after a 5.5 GB write burst, and the soak
+    test settled at 110–140 MiB instead of 50–56 MiB for three busy disks.
 - **Object-store requests**: one PUT per sealed segment and nothing when idle. Opening a disk does
   `LIST`s plus one `GET` per replayed segment.
   - Under `remote`, every flush that has new data seals a segment, so the PUT count follows the

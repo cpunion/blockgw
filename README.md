@@ -130,7 +130,7 @@ Requirements:
 cargo build --release
 sudo modprobe ublk_drv
 cp examples/config.json /etc/blockgw.json   # edit endpoint, bucket, credentials, disks (or use config.local.json)
-sudo MALLOC_ARENA_MAX=2 target/release/blockgw serve /etc/blockgw.json &   # supervisor + worker
+sudo target/release/blockgw serve /etc/blockgw.json &   # supervisor + worker
 sudo mkfs.xfs /dev/ublkb0 && sudo mount /dev/ublkb0 /mnt
 
 target/release/blockgw ctl /run/blockgw.sock stats
@@ -168,6 +168,8 @@ On macOS or Windows, run blockgw in a Linux VM; see [docs/local-dev.md](docs/loc
   mount and pass `xfs_repair -n`, and under `remote` every fsynced file must be intact.
 - `sudo tests/torture/fencetorture.py`: repeated takeovers by a second server while the old one
   keeps taking writes; the new owner must hold an exact prefix, the old one must be fenced.
+- `sudo tests/soak/soak.py`: hours of filesystem churn on several disks; worker memory,
+  descriptors and threads must stay flat and GC must keep the store bounded (daily in CI).
 - `bench/bench.sh`: the benchmark behind the numbers above.
 
 See [docs/testing.md](docs/testing.md).
@@ -178,7 +180,7 @@ See [docs/testing.md](docs/testing.md).
 2. Key rotation for encrypted disks.
 3. Bounded local cache: evict cold, already-uploaded blocks so a host keeps only a working set
    (lazy restore already fetches blocks on first read).
-4. Zero-copy ublk (Linux 6.15+); long-running soak tests.
+4. Zero-copy ublk (Linux 6.15+).
 5. Native macOS and Windows frontends (research: an iSCSI target for Windows' built-in initiator;
    an FSKit-served image file attached with `hdiutil` on macOS).
 

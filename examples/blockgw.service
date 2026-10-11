@@ -10,7 +10,6 @@ Type=simple
 ExecStartPre=/sbin/modprobe ublk_drv
 ExecStartPre=/usr/local/bin/blockgw check-config /etc/blockgw.json
 ExecStart=/usr/local/bin/blockgw serve /etc/blockgw.json --orphan-timeout 30
-Environment=MALLOC_ARENA_MAX=2
 Environment=BLOCKGW_LOG=info
 # SIGTERM drains every disk's upload queue (up to 60 s per disk) before exiting
 KillSignal=SIGTERM

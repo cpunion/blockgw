@@ -61,6 +61,13 @@ const IO_BUF: u32 = 256 << 10;
 static FETCH: std::sync::OnceLock<Arc<dev::FetchPool>> = std::sync::OnceLock::new();
 
 fn main() -> Result<()> {
+    // glibc gives each thread that allocates its own arena and keeps freed memory there; with
+    // segment buffers allocated by one thread and freed by another, RSS settles near 100 MiB more
+    // than the live data. Two arenas keep it close to what is actually held.
+    #[cfg(target_env = "gnu")]
+    unsafe {
+        libc::mallopt(libc::M_ARENA_MAX, 2);
+    }
     let args: Vec<String> = std::env::args().collect();
     match args.get(1).map(String::as_str) {
         Some("serve") => {
