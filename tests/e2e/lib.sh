@@ -89,7 +89,15 @@ cleanup() {
   local m p id
   [ -f "$W/mounts" ] && tac "$W/mounts" | while read -r m; do umount "$m" 2>/dev/null || umount -l "$m" 2>/dev/null; done
   [ -f "$W/ids" ] && for id in $(sort -u "$W/ids"); do [ -e "/sys/class/ublk-char/ublkc$id" ] && timeout 20 "$BLOCKGW" del "$id" >/dev/null 2>&1; done
-  [ -f "$W/pids" ] && for p in $(cat "$W/pids"); do kill -9 "$p" 2>/dev/null; done
+  # deleting its devices makes a server return from main; give it time to exit cleanly (an
+  # instrumented build writes its coverage profile at exit), then kill whatever is left
+  if [ -f "$W/pids" ]; then
+    for _ in $(seq 1 100); do
+      local alive=0; for p in $(cat "$W/pids"); do kill -0 "$p" 2>/dev/null && alive=1; done
+      [ $alive = 0 ] && break; sleep 0.1
+    done
+    for p in $(cat "$W/pids"); do kill -9 "$p" 2>/dev/null; done
+  fi
   [ -f "$W/ids" ] && for id in $(sort -u "$W/ids"); do [ -e "/sys/class/ublk-char/ublkc$id" ] && timeout 20 "$BLOCKGW" del "$id" >/dev/null 2>&1; done
   true
 }

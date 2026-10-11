@@ -1,0 +1,16 @@
+coverage:
+  status:
+    project:
+      default:
+        target: auto
+        threshold: 1%
+    patch:
+      default:
+        target: 70%
+comment:
+  layout: "diff, flags, files"
+flags:
+  unit:
+    carryforward: true
+  e2e:
+    carryforward: true
