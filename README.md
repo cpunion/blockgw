@@ -14,10 +14,12 @@ Its history is a strictly ordered log of segments uploaded to S3, R2, or any S3-
 You can restore a disk on any host from the log alone, and a second host that opens the disk fences
 out the first.
 
-> **Status: experimental.** The write path, crash recovery and supervision, checkpointed and lazy
-> restore, garbage collection, fencing and encryption at rest work and are covered by tests. A host
-> still ends up holding each disk's full image (no bounded cache yet), and there is no standby
-> replication. Do not use it for data you cannot afford to lose. See [Roadmap](#roadmap).
+> **Status: beta.** The write path, crash recovery and supervision, checkpointed and lazy restore,
+> garbage collection, fencing, encryption at rest and runtime attach/detach work, and are checked
+> on every pull request by 23 end-to-end cases and 8 crash-consistency torture jobs (block level,
+> XFS level and takeovers), plus a daily soak; the suite also passes against Cloudflare R2. Not yet:
+> standby replication (under `local`, losing a host loses up to `seal_interval_ms` plus the upload
+> lag), block-level cache eviction, key rotation, and production mileage. See [Roadmap](#roadmap).
 
 ## Why
 
