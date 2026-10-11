@@ -219,10 +219,18 @@ Checks:
 4. Every disk restores to a filesystem that `xfs_repair -n` finds clean, with its fsynced files
    intact.
 
-Its first run measured 110–140 MiB of worker RSS (beyond held segments) for three disks: glibc's
-per-thread malloc arenas keeping freed segment buffers. blockgw now limits glibc to two arenas at
-startup, and the same run measures 50–56 MiB. A 6-minute run with three disks keeps about 6,400
-segments (1.3–1.5× the live data) per disk in the store.
+Findings so far:
+
+- The first run measured 110–140 MiB of worker RSS (beyond held segments) for three disks: glibc's
+  per-thread malloc arenas keeping freed segment buffers. blockgw now limits glibc to two arenas
+  at startup, and the same run measured 50–56 MiB.
+- After batched sealing (large segments), the first daily run found the store at 12–25× the live
+  data: checkpoints were only written per 64 segments, and GC keeps two checkpoint intervals.
+  Checkpoints are now also written per 64 MiB written (`checkpoint_mb`); a 10-minute run holds
+  2–3× the live data. With larger segments the worker holds more in flight: 90–125 MiB of RSS
+  beyond queued segments for three disks writing tens of MB/s.
+- That run also saw one EIO on a log write that blockgw did not explain. It has not recurred;
+  every failed I/O is now logged with its cause and errno.
 
 ## In CI
 

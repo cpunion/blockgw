@@ -76,6 +76,7 @@ Suggested alerts:
 | `max_lag_mb` | 16 | upload lag allowed under `local` before writers wait |
 | `seal_interval_ms` | 1000 | seal the open segment once its oldest write is this old; under `local` flushes do not seal, so this sets the PUT rate and adds to the loss window (0 = seal at every flush) |
 | `checkpoint_every` | 64 | committed segments between checkpoints (also every 60 s if anything committed) |
+| `checkpoint_mb` | 64 | also checkpoint after this much data written since the last checkpoint; GC keeps up to two checkpoint intervals of segments, so this bounds the store at about live data + 2 × `checkpoint_mb` plus what repack has not caught up with |
 | `gc` | `true` | run garbage collection after each checkpoint |
 | `repack_ratio` | 0.5 | repack segments whose live fraction is below this |
 | `repack_budget_mb` | 64 | live data rewritten per GC round |

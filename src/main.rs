@@ -321,7 +321,8 @@ async fn flush(d: &Dev) -> i32 {
         return r;
     }
     if let Some(pages) = presence {
-        if d.presence_persist(pages).is_err() {
+        if let Err(e) = d.presence_persist(pages) {
+            warn!("disk {}: persisting the presence bitmap failed: {e:#}", d.cfg.id);
             return -libc::EIO;
         }
     }
@@ -342,7 +343,25 @@ async fn flush(d: &Dev) -> i32 {
     }
 }
 
-async fn handle(_q: &UblkQueue<'_>, tag: u16, d: &Arc<Dev>, io: &mut [u8]) -> i32 {
+/// Serve one request; every failure (other than a fenced disk, which logs FENCED once) is logged
+/// with its cause, since the kernel only reports "I/O error" whatever the errno.
+async fn handle(q: &UblkQueue<'_>, tag: u16, d: &Arc<Dev>, io: &mut [u8]) -> i32 {
+    let res = handle_op(q, tag, d, io).await;
+    if res < 0 && !d.fenced.load(SeqCst) {
+        let iod = q.get_iod(tag);
+        warn!(
+            "disk {}: I/O failed: op {} at byte {} len {}: {}",
+            d.cfg.id,
+            iod.op_flags & 0xff,
+            iod.start_sector << 9,
+            iod.nr_sectors << 9,
+            std::io::Error::from_raw_os_error(-res)
+        );
+    }
+    res
+}
+
+async fn handle_op(_q: &UblkQueue<'_>, tag: u16, d: &Arc<Dev>, io: &mut [u8]) -> i32 {
     if d.fenced.load(SeqCst) {
         return -libc::EIO;
     }
@@ -364,7 +383,13 @@ async fn handle(_q: &UblkQueue<'_>, tag: u16, d: &Arc<Dev>, io: &mut [u8]) -> i3
             uring(opcode::Read::new(types::Fixed(1), io.as_mut_ptr(), bytes).offset(off).build()).await
         }
         libublk::sys::UBLK_IO_OP_WRITE => {
-            let Ok(rg) = d.intent_begin(off, bytes as u64) else { return -libc::EIO };
+            let rg = match d.intent_begin(off, bytes as u64) {
+                Ok(rg) => rg,
+                Err(e) => {
+                    warn!("disk {}: persisting the write-intent map failed: {e:#}", d.cfg.id);
+                    return -libc::EIO;
+                }
+            };
             d.write_begin(off, bytes as u64);
             let r = uring(opcode::Write::new(types::Fixed(1), io.as_ptr(), bytes).offset(off).build()).await;
             d.write_end(off, bytes as u64, r >= 0);
@@ -386,11 +411,20 @@ async fn handle(_q: &UblkQueue<'_>, tag: u16, d: &Arc<Dev>, io: &mut [u8]) -> i3
         }
         libublk::sys::UBLK_IO_OP_FLUSH => flush(d).await,
         libublk::sys::UBLK_IO_OP_DISCARD | libublk::sys::UBLK_IO_OP_WRITE_ZEROES => {
-            let Ok(rg) = d.intent_begin(off, bytes as u64) else { return -libc::EIO };
+            let rg = match d.intent_begin(off, bytes as u64) {
+                Ok(rg) => rg,
+                Err(e) => {
+                    warn!("disk {}: persisting the write-intent map failed: {e:#}", d.cfg.id);
+                    return -libc::EIO;
+                }
+            };
             d.write_begin(off, bytes as u64);
             let (r, seq) = match log::punch(d.image.as_raw_fd(), off, bytes as u64).and_then(|_| d.zero_absent(off, bytes as u64)) {
                 Ok(_) => (0, Some(d.append_discard(off, bytes))),
-                Err(_) => (-libc::EIO, None),
+                Err(e) => {
+                    warn!("disk {}: discard in the image failed: {e:#}", d.cfg.id);
+                    (-libc::EIO, None)
+                }
             };
             d.write_end(off, bytes as u64, r == 0);
             d.intent_end(rg, seq);

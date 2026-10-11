@@ -71,10 +71,16 @@ pub struct DevConfig {
     /// encrypt every object of this disk with the 32-byte key in this file (see crypt.rs)
     #[serde(default)]
     pub key_file: Option<String>,
+    /// also checkpoint after this much data was uploaded since the last checkpoint
+    #[serde(default = "default_ckpt_mb")]
+    pub checkpoint_mb: u64,
     /// seal the open segment once its oldest write is this old (0 = only on flush and size). Under
     /// `local` a flush does not seal, so this batches the writes of many flushes into one PUT.
     #[serde(default = "default_seal_interval")]
     pub seal_interval_ms: u64,
+}
+fn default_ckpt_mb() -> u64 {
+    64
 }
 fn default_seal_interval() -> u64 {
     1000
@@ -187,7 +193,9 @@ pub struct Dev {
     /// committed extent map; updated in commit order, together with `committed`
     cmap: Mutex<ExtentMap>,
     store: Arc<dyn Store>,
-    last_ckpt: AtomicU64, // `committed` value covered by the last checkpoint
+    last_ckpt: AtomicU64,      // `committed` value covered by the last checkpoint
+    last_ckpt_user: AtomicU64, // user_bytes when the last checkpoint was written
+    user_bytes: AtomicU64,     // data appended by writes (not by repack), for checkpoint_mb
     last_ckpt_at: Mutex<Instant>,
     /// the last two checkpoints written by this server (GC deletes against both)
     ckpts: Mutex<VecDeque<crate::gc::Checkpoint>>,
@@ -316,6 +324,8 @@ impl Dev {
             cmap: Mutex::new(cmap),
             store,
             last_ckpt: AtomicU64::new(0),
+            last_ckpt_user: AtomicU64::new(0),
+            user_bytes: AtomicU64::new(0),
             last_ckpt_at: Mutex::new(Instant::now()),
             // the checkpoint this disk was opened from counts as the previous one for GC
             ckpts: Mutex::new(loaded_ckpt.into_iter().collect()),
@@ -572,6 +582,7 @@ impl Dev {
         if o.is_empty() {
             self.open_since.store(mono_ms(), SeqCst);
         }
+        self.user_bytes.fetch_add(d.len() as u64, SeqCst);
         o.push_data(off, d);
         let full = o.data_len() >= MAX_SEG;
         drop(o);
@@ -796,6 +807,7 @@ impl Dev {
         }
         drop(ck);
         self.last_ckpt.store(c, SeqCst);
+        self.last_ckpt_user.store(self.user_bytes.load(SeqCst), SeqCst);
         *self.last_ckpt_at.lock().unwrap() = Instant::now();
         crate::debug!("disk {}: checkpoint {key} ({} bytes)", self.cfg.id, bytes.len());
         Ok(true)
@@ -809,7 +821,13 @@ impl Dev {
                 return;
             }
             let (c, last) = (self.committed.load(SeqCst), self.last_ckpt.load(SeqCst));
+            // by segments, by bytes or by time: GC keeps everything above the older of the last two
+            // checkpoints, so the store holds up to two intervals of segments; with large (batched)
+            // segments only a byte limit keeps that bounded. Only data written by users counts:
+            // repack copies made by GC would otherwise trigger the next round themselves.
+            let uploaded = self.user_bytes.load(SeqCst) - self.last_ckpt_user.load(SeqCst);
             let due = c >= last + self.cfg.checkpoint_every.max(1)
+                || (c > last && uploaded >= self.cfg.checkpoint_mb.max(1) << 20)
                 || (c > last && self.last_ckpt_at.lock().unwrap().elapsed().as_secs() >= CKPT_INTERVAL_SECS);
             if due {
                 match self.checkpoint() {
