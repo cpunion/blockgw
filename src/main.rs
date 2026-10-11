@@ -16,6 +16,7 @@ mod dev;
 mod failpoint;
 mod log;
 mod s3;
+mod store;
 mod supervise;
 mod track;
 
@@ -35,7 +36,10 @@ use std::sync::Arc;
 
 #[derive(serde::Deserialize)]
 struct Config {
-    s3: s3::S3Config,
+    /// S3-compatible object store for the segment log...
+    s3: Option<s3::S3Config>,
+    /// ...or a local directory (development, tests, or a second disk / NAS mount)
+    local_store: Option<String>,
     control_socket: String,
     devices: Vec<DevConfig>,
     upload_workers: Option<usize>,
@@ -81,6 +85,7 @@ fn main() -> Result<()> {
 
 fn load_config(path: &str) -> Result<Config> {
     let cfg: Config = serde_json::from_slice(&std::fs::read(path).with_context(|| format!("read {path}"))?).context("parse config")?;
+    anyhow::ensure!(cfg.s3.is_some() != cfg.local_store.is_some(), "configure exactly one of \"s3\" and \"local_store\"");
     let mut ids = std::collections::HashSet::new();
     for d in &cfg.devices {
         anyhow::ensure!(ids.insert(d.id), "device id {} appears twice", d.id);
@@ -100,16 +105,20 @@ fn load_config(path: &str) -> Result<Config> {
 fn worker(path: &str) -> Result<()> {
     let cfg = load_config(path)?;
     supervise::install_term_handler();
-    let s3 = Arc::new(s3::S3::new(&cfg.s3)?);
+    let s3: Arc<dyn store::Store> = match (&cfg.s3, &cfg.local_store) {
+        (Some(c), None) => Arc::new(s3::S3::new(c)?),
+        (None, Some(dir)) => Arc::new(store::LocalDir::new(dir)?),
+        _ => unreachable!("validated by load_config"),
+    };
     let pool = dev::Pool::new();
     for i in 0..cfg.upload_workers.unwrap_or(16) {
         let (p, s) = (pool.clone(), s3.clone());
-        std::thread::Builder::new().name(format!("put-{i}")).spawn(move || p.worker(&s))?;
+        std::thread::Builder::new().name(format!("put-{i}")).spawn(move || p.worker(s.as_ref()))?;
     }
     let mut devs = Vec::new();
     for dc in cfg.devices.clone() {
         failpoint::hit("open")?;
-        let d = Arc::new(Dev::open(dc, &s3)?);
+        let d = Arc::new(Dev::open(dc, s3.as_ref())?);
         let (d2, p2) = (d.clone(), pool.clone());
         std::thread::Builder::new().name(format!("disp-{}", d.cfg.id)).spawn(move || d2.dispatcher(&p2))?;
         d.recover()?; // before attach: the crashed run's un-uploaded tail goes first

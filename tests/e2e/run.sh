@@ -6,7 +6,7 @@
 #   sudo tests/e2e/run.sh 03 05           # cases whose file name starts with 03 or 05
 #
 # Environment: BLOCKGW (binary, default target/release/blockgw), S3_ENDPOINT, S3_BUCKET,
-# S3_ACCESS_KEY, S3_SECRET_KEY, S3_REGION, E2E_WORK (scratch dir), ID_BASE (first ublk id, default 200),
+# S3_ACCESS_KEY, S3_SECRET_KEY, S3_REGION, E2E_STORE (s3 | dir), E2E_WORK (scratch dir), ID_BASE (first ublk id, default 200),
 # KEEP_S3=1 (leave the SeaweedFS container running).
 set -uo pipefail
 HERE=$(cd "$(dirname "$0")" && pwd)
@@ -23,7 +23,10 @@ WORK=${E2E_WORK:-/tmp/blockgw-e2e}
 for t in mkfs.xfs python3 sha256sum fstrim; do command -v $t >/dev/null || { echo "missing tool: $t"; exit 2; }; done
 
 started_s3=""
-if [ -z "${S3_ENDPOINT:-}" ]; then
+export E2E_STORE=${E2E_STORE:-s3}   # s3 (SeaweedFS or $S3_ENDPOINT) or dir (local_store in each case's work dir)
+if [ "$E2E_STORE" = dir ]; then
+  :
+elif [ -z "${S3_ENDPOINT:-}" ]; then
   command -v docker >/dev/null || { echo "set S3_ENDPOINT or install docker"; exit 2; }
   docker rm -f blockgw-e2e-s3 >/dev/null 2>&1
   docker run -d --name blockgw-e2e-s3 -p 127.0.0.1:8333:8333 chrislusf/seaweedfs:4.47 server -s3 -dir=/data >/dev/null || exit 2
@@ -31,7 +34,7 @@ if [ -z "${S3_ENDPOINT:-}" ]; then
   export S3_ENDPOINT=http://127.0.0.1:8333
   for i in $(seq 1 60); do curl -s -o /dev/null http://127.0.0.1:8333/ && break; sleep 1; done
 fi
-curl -s -o /dev/null -X PUT "$S3_ENDPOINT/$S3_BUCKET" || true   # anonymous bucket create (SeaweedFS default)
+[ "$E2E_STORE" = dir ] || curl -s -o /dev/null -X PUT "$S3_ENDPOINT/$S3_BUCKET" || true   # anonymous bucket create (SeaweedFS default)
 
 mapfile -t CASES < <(ls "$HERE"/cases/*.sh | sort)
 if [ $# -gt 0 ]; then
@@ -39,7 +42,7 @@ if [ $# -gt 0 ]; then
 fi
 
 RUN=$(date +%Y%m%d-%H%M%S)-$$
-echo "TAP version 13"; echo "1..${#CASES[@]}"
+echo "TAP version 13"; echo "# store: $E2E_STORE"; echo "1..${#CASES[@]}"
 n=0; failed=0; slot=0
 for c in "${CASES[@]}"; do
   n=$((n + 1)); name=$(basename "$c" .sh)

@@ -12,5 +12,7 @@ comment:
 flags:
   unit:
     carryforward: true
-  e2e:
+  e2e-s3:
+    carryforward: true
+  e2e-dir:
     carryforward: true

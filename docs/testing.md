@@ -24,6 +24,7 @@ CI runs the unit layer and the end-to-end suite on every pull request
 | Module | Tests cover |
 |---|---|
 | `src/log.rs` | key encoding (numeric order), segment encode/decode round trip, rejection of corrupt segments (truncation, trailing bytes, overflowing entry counts, unknown kinds), header/key mismatch, object codec (zstd vs raw for incompressible data, tombstones), applying writes and discards to an image, contiguous-prefix rule, fence targets covering gaps and the in-flight window |
+| `src/store.rs` | local-directory store: create-only PUT with exactly one winner among 16 concurrent creators, no temporary files left behind, sorted prefix listing (including a partial last component), rejection of keys that would escape the root |
 | `src/track.rs` | a region needs persisting on first write only; bits clear only after the last write's segment is committed and nothing is in flight; failed writes do not pin a region; overlapping writes keep the latest segment; bitmap round trip (padding bits ignored); commit of out-of-order completions only as a contiguous prefix |
 
 ## End-to-end suite
@@ -31,6 +32,8 @@ CI runs the unit layer and the end-to-end suite on every pull request
 `tests/e2e/run.sh` behaves as follows:
 
 - It starts a SeaweedFS container unless `S3_ENDPOINT` is set, and creates the bucket.
+  `E2E_STORE=dir` uses a local-directory store in each case's work dir instead. CI runs the suite
+  with both stores.
 - It runs each case in `tests/e2e/cases/` in its own subshell, with a scratch directory, a unique
   object prefix and a block of ublk ids.
 - It always cleans up (unmount, kill servers, delete devices) and prints TAP.

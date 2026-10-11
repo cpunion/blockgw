@@ -37,9 +37,15 @@ jobs:
           fail_ci_if_error: false
 
   e2e:
-    name: end-to-end (ublk + SeaweedFS)
+    name: end-to-end (ublk, ${{ matrix.store }} store)
     runs-on: ubuntu-24.04
     timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        store: [s3, dir]
+    env:
+      E2E_STORE: ${{ matrix.store }}
     steps:
       - uses: actions/checkout@v5
       - name: Install dependencies and load ublk
@@ -75,12 +81,12 @@ jobs:
         if: always()
         with:
           files: e2e.lcov
-          flags: e2e
+          flags: e2e-${{ matrix.store }}
           use_oidc: true
           fail_ci_if_error: false
       - name: Upload logs on failure
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: e2e-logs
+          name: e2e-logs-${{ matrix.store }}
           path: /tmp/blockgw-e2e
