@@ -302,6 +302,10 @@ fn start_disk(dc: DevConfig) -> Result<Arc<Dev>> {
     std::thread::Builder::new().name(format!("ckpt-{}", d.cfg.id)).spawn(move || d3.checkpointer())?;
     let d4 = d.clone();
     std::thread::Builder::new().name(format!("hydrate-{}", d.cfg.id)).spawn(move || d4.hydrator())?;
+    if d.cfg.cache_mb > 0 {
+        let d6 = d.clone();
+        std::thread::Builder::new().name(format!("evict-{}", d.cfg.id)).spawn(move || d6.evictor())?;
+    }
     let d5 = d.clone();
     let h = std::thread::Builder::new().name(format!("ublk-{}", d.cfg.id)).spawn(move || {
         if let Err(e) = run_disk(d5) {
@@ -583,18 +587,23 @@ async fn handle_op(_q: &UblkQueue<'_>, tag: u16, d: &Arc<Dev>, io: &mut [u8]) ->
     let bytes = iod.nr_sectors << 9;
     match op {
         libublk::sys::UBLK_IO_OP_READ => {
+            d.read_begin(off, bytes as u64); // before the presence check: eviction skips the region now
             if d.has_absent(off, bytes as u64) {
-                // lazy restore: fetch the missing blocks off the queue thread, then read the image
+                // lazy restore or evicted: fetch the missing blocks off the queue thread, then read the image
                 let failed = Arc::new(std::sync::atomic::AtomicU64::new(0));
                 let (dd, f2) = (d.clone(), failed.clone());
                 wait_efd(|fd| FETCH.get().expect("fetch pool").submit(dd, off, bytes as u64, fd, f2)).await;
                 if failed.load(SeqCst) != 0 {
+                    d.read_end(off, bytes as u64);
                     return -libc::EIO;
                 }
             }
-            uring(opcode::Read::new(types::Fixed(1), io.as_mut_ptr(), bytes).offset(off).build()).await
+            let r = uring(opcode::Read::new(types::Fixed(1), io.as_mut_ptr(), bytes).offset(off).build()).await;
+            d.read_end(off, bytes as u64);
+            r
         }
         libublk::sys::UBLK_IO_OP_WRITE => {
+            d.touch(off, bytes as u64);
             let rg = match d.intent_begin(off, bytes as u64) {
                 Ok(rg) => rg,
                 Err(e) => {

@@ -56,6 +56,7 @@ def main():
     ap.add_argument("--work", default="/tmp/blockgw-fstorture")
     ap.add_argument("--upload-error-pct", type=int, default=10)
     ap.add_argument("--encrypt", action="store_true")
+    ap.add_argument("--cache-mb", type=int, default=0, help="local cache budget: evict while the workload runs")
     ap.add_argument("--max-copies", type=int, default=30, help="store copies kept and checked (a uniform sample)")
     a = ap.parse_args()
     blockgw = os.path.abspath(a.blockgw)
@@ -71,7 +72,7 @@ def main():
             f.write(os.urandom(32))
 
     store, cfg, mnt = os.path.join(work, "store"), os.path.join(work, "main.json"), os.path.join(work, "mnt")
-    write_config(cfg, store, os.path.join(work, "img"), a.id, a.policy, key_file)
+    write_config(cfg, store, os.path.join(work, "img"), a.id, a.policy, key_file, a.cache_mb)
     srv = Server(blockgw, cfg, ["--orphan-timeout", "120"], {"BLOCKGW_FAILPOINTS": f"upload=error%{a.upload_error_pct}"})
     used_ids, failures, mounts = [a.id], [], []
     try:

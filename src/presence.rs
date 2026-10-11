@@ -105,6 +105,18 @@ impl Presence {
         self.set(b);
     }
 
+    /// Evict `b` from the local image (cache budget): it becomes absent unless a write is in
+    /// flight. Returns whether it changed.
+    pub fn evict(&mut self, b: u64) -> bool {
+        let (w, m) = ((b / 64) as usize, 1u64 << (b % 64));
+        if self.bits[w] & m == 0 || self.writing.contains_key(&b) {
+            return false;
+        }
+        self.bits[w] &= !m;
+        self.absent += 1;
+        true
+    }
+
     pub fn to_bytes(&self) -> Vec<u8> {
         self.bits.iter().flat_map(|w| w.to_le_bytes()).collect()
     }
@@ -156,6 +168,18 @@ mod tests {
         p.write_end(5, 1, false);
         assert!(p.fillable(5), "a failed write leaves the block absent");
         assert_eq!(p.absent(), 6);
+    }
+
+    #[test]
+    fn evict_skips_blocks_being_written() {
+        let mut p = Presence::full(16);
+        p.write_begin(3, 1);
+        assert!(!p.evict(3), "a block being written stays");
+        assert!(p.evict(4) && !p.evict(4));
+        assert_eq!(p.absent(), 1);
+        assert!(p.fillable(4));
+        p.filled(4);
+        assert_eq!(p.absent(), 0);
     }
 
     #[test]

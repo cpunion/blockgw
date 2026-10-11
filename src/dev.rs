@@ -23,7 +23,7 @@ use std::fs::{File, OpenOptions};
 use std::os::unix::fs::{FileExt, OpenOptionsExt};
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering::*};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering::*};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Instant;
 
@@ -81,6 +81,10 @@ pub struct DevConfig {
     /// `local` a flush does not seal, so this batches the writes of many flushes into one PUT.
     #[serde(default = "default_seal_interval")]
     pub seal_interval_ms: u64,
+    /// keep at most this much of the disk's data in the local image (0 = all of it): cold regions
+    /// whose writes are all committed are dropped and fetched again when read
+    #[serde(default)]
+    pub cache_mb: u64,
 }
 fn default_ckpt_mb() -> u64 {
     64
@@ -161,6 +165,7 @@ pub struct Stats {
     pub gc_deleted_segments: AtomicU64,
     pub gc_deleted_bytes: AtomicU64,
     pub gc_repacked_bytes: AtomicU64,
+    pub evicted_bytes: AtomicU64,
     pub fetched_bytes: AtomicU64,
     pub fetch_errors: AtomicU64,
 }
@@ -170,7 +175,8 @@ pub struct Stats {
 struct LazyState {
     p: crate::presence::Presence,
     dirty_pages: BTreeSet<usize>,
-    file_present: bool, // a presence file exists on disk
+    file_present: bool,                           // a presence file exists on disk
+    reading: std::collections::HashMap<u64, u32>, // region -> reads in flight (cache eviction only)
 }
 
 const PRESENCE_PAGE: usize = 4096; // bytes of bitmap per persisted page (32768 blocks)
@@ -205,6 +211,10 @@ pub struct Dev {
     lazy: Mutex<LazyState>,
     fully_present: AtomicBool,
     presence_file: File,
+    /// per region, mono_ms()/1000 of the last read or write (cache eviction)
+    access: Vec<AtomicU32>,
+    /// rekey needs every block local: no eviction meanwhile
+    evict_paused: AtomicBool,
     metas: restore::MetaCache,
     queue_cv: Condvar,
     pub epoch: u64,
@@ -308,6 +318,10 @@ impl Dev {
                 presence.absent()
             );
         }
+        if !presence_path.exists() {
+            // an explicit file, even when every block is local: an empty file would read as all absent
+            write_synced(&presence_path, &presence.to_bytes())?;
+        }
         let tmp = dir.join("state.json.tmp");
         std::fs::write(&tmp, serde_json::to_vec(&LocalState { epoch })?)?;
         File::open(&tmp)?.sync_all()?;
@@ -336,7 +350,9 @@ impl Dev {
             // the checkpoint this disk was opened from counts as the previous one for GC
             ckpts: Mutex::new(loaded_ckpt.into_iter().collect()),
             fully_present: AtomicBool::new(presence.absent() == 0),
-            lazy: Mutex::new(LazyState { file_present: presence.absent() > 0, p: presence, dirty_pages: BTreeSet::new() }),
+            lazy: Mutex::new(LazyState { file_present: true, p: presence, dirty_pages: BTreeSet::new(), reading: Default::default() }),
+            access: (0..size.div_ceil(REGION)).map(|_| AtomicU32::new(0)).collect(),
+            evict_paused: AtomicBool::new(false),
             presence_file: OpenOptions::new().read(true).write(true).create(true).truncate(false).open(&presence_path)?,
             metas: restore::MetaCache::default(),
             queue_cv: Condvar::new(),
@@ -486,13 +502,157 @@ impl Dev {
             self.presence_file.write_all_at(b, (pg * PRESENCE_PAGE) as u64)?;
         }
         self.presence_file.sync_data()?;
-        let mut l = self.lazy.lock().unwrap();
-        if l.p.absent() == 0 && l.dirty_pages.is_empty() && l.file_present {
-            l.file_present = false;
-            let _ = std::fs::remove_file(PathBuf::from(&self.cfg.dir).join("presence"));
-            crate::info!("disk {}: fully hydrated", self.cfg.id);
-        }
         Ok(())
+    }
+
+    /// A read of `[off, off + len)` starts / ends; with a cache budget, eviction skips regions with
+    /// reads in flight (a read that found its blocks present must find them still there).
+    pub fn read_begin(&self, off: u64, len: u64) {
+        self.touch(off, len);
+        if self.cfg.cache_mb > 0 {
+            let mut l = self.lazy.lock().unwrap();
+            for r in off / REGION..=(off + len.max(1) - 1) / REGION {
+                *l.reading.entry(r).or_insert(0) += 1;
+            }
+        }
+    }
+    pub fn read_end(&self, off: u64, len: u64) {
+        if self.cfg.cache_mb > 0 {
+            let mut l = self.lazy.lock().unwrap();
+            for r in off / REGION..=(off + len.max(1) - 1) / REGION {
+                if let Some(c) = l.reading.get_mut(&r) {
+                    *c -= 1;
+                    if *c == 0 {
+                        l.reading.remove(&r);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Record an access for the eviction order.
+    pub fn touch(&self, off: u64, len: u64) {
+        if self.cfg.cache_mb > 0 {
+            let now = (mono_ms() / 1000) as u32;
+            for r in off / REGION..=((off + len.max(1) - 1) / REGION).min(self.access.len() as u64 - 1) {
+                self.access[r as usize].store(now, Relaxed);
+            }
+        }
+    }
+
+    /// Bytes of the local image that hold data (allocated blocks).
+    pub fn cached_bytes(&self) -> u64 {
+        self.image_buf.metadata().map(|m| std::os::unix::fs::MetadataExt::blocks(&m) * 512).unwrap_or(0)
+    }
+
+    /// Keep the local image within `cache_mb`: drop the least recently used regions whose writes are
+    /// all committed (the object store has exactly what the image has), down to 90% of the budget.
+    pub fn evictor(&self) {
+        let budget = self.cfg.cache_mb << 20;
+        if budget == 0 {
+            return;
+        }
+        loop {
+            std::thread::sleep(std::time::Duration::from_secs(1));
+            if self.fenced.load(SeqCst) || self.stopped.load(SeqCst) {
+                return;
+            }
+            if self.evict_paused.load(SeqCst) || self.cached_bytes() <= budget {
+                continue;
+            }
+            let mut order: Vec<usize> = (0..self.access.len()).collect();
+            order.sort_by_key(|r| self.access[*r].load(Relaxed));
+            for r in order {
+                if self.cached_bytes() <= budget / 10 * 9 || self.stopped.load(SeqCst) {
+                    break;
+                }
+                match self.evict_region(r) {
+                    Ok(n) => {
+                        self.stats.evicted_bytes.fetch_add(n, Relaxed);
+                    }
+                    Err(e) => {
+                        crate::warn!("disk {}: evicting region {r} failed: {e:#}", self.cfg.id);
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Drop the data of region `r` from the local image if all its writes are committed and no I/O
+    /// touches it. Locks, in order: open segment (no repack copy reads the image meanwhile), regions
+    /// (no write starts), lazy (no read starts, no fetch fills). The bitmap is persisted with the
+    /// blocks absent before the hole is punched, so it never claims a punched block present.
+    fn evict_region(&self, r: usize) -> Result<u64> {
+        let bs = crate::extmap::BLOCK;
+        let (start, end) = (r as u64 * REGION, ((r as u64 + 1) * REGION).min(self.size));
+        let _o = self.open.lock().unwrap();
+        let g = self.regions.lock().unwrap();
+        if !g.t.clean(r) {
+            return Ok(0);
+        }
+        let mut l = self.lazy.lock().unwrap();
+        if l.reading.contains_key(&(r as u64)) {
+            return Ok(0);
+        }
+        let fd = self.image_buf.as_raw_fd();
+        let mut extents = Vec::new();
+        let mut pos = start;
+        while pos < end {
+            let d = unsafe { libc::lseek(fd, pos as i64, libc::SEEK_DATA) };
+            if d < 0 || d as u64 >= end {
+                break;
+            }
+            let h = unsafe { libc::lseek(fd, d, libc::SEEK_HOLE) };
+            let dend = if h < 0 { end } else { (h as u64).min(end) };
+            extents.push((d as u64, dend));
+            pos = dend;
+        }
+        if extents.is_empty() {
+            return Ok(0);
+        }
+        let map = self.cmap.lock().unwrap();
+        let mut gone = Vec::new();
+        for &(a, z) in &extents {
+            for b in a / bs..z.div_ceil(bs) {
+                // only blocks the store holds; a block the map does not point at reads as zeros
+                if map.get(b).is_some() && l.p.is_present(b) {
+                    gone.push(b);
+                }
+            }
+        }
+        drop(map);
+        if gone.is_empty() {
+            return Ok(0);
+        }
+        self.image_buf.sync_data()?; // every bit the pages below claim present is durable
+        for &b in &gone {
+            if l.p.evict(b) {
+                l.dirty_pages.insert((b / 8) as usize / PRESENCE_PAGE);
+            }
+        }
+        let bytes = l.p.to_bytes();
+        let pages: BTreeSet<usize> = gone.iter().map(|b| (b / 8) as usize / PRESENCE_PAGE).collect();
+        for pg in pages {
+            let s = pg * PRESENCE_PAGE;
+            self.presence_file.write_all_at(&bytes[s.min(bytes.len())..(s + PRESENCE_PAGE).min(bytes.len())], s as u64)?;
+        }
+        self.presence_file.sync_data()?;
+        self.fully_present.store(false, Release);
+        let mut freed = 0;
+        let mut i = 0;
+        while i < gone.len() {
+            let mut j = i + 1;
+            while j < gone.len() && gone[j] == gone[j - 1] + 1 {
+                j += 1;
+            }
+            log::punch(fd, gone[i] * bs, (j - i) as u64 * bs)?;
+            freed += (j - i) as u64 * bs;
+            i = j;
+        }
+        drop(l);
+        drop(g);
+        Ok(freed)
     }
 
     /// Background hydration after a lazy restore, at `hydrate_mbps`.
@@ -500,7 +660,13 @@ impl Dev {
         let blocks = self.size.div_ceil(crate::extmap::BLOCK);
         let chunk = 256u64; // 1 MiB of blocks per step
         let mut next = 0u64;
-        while self.cfg.hydrate_mbps > 0 && !self.fully_present.load(Acquire) && !self.fenced.load(SeqCst) && !self.stopped.load(SeqCst) {
+        // with a cache budget, blocks come back only when read
+        while self.cfg.hydrate_mbps > 0
+            && self.cfg.cache_mb == 0
+            && !self.fully_present.load(Acquire)
+            && !self.fenced.load(SeqCst)
+            && !self.stopped.load(SeqCst)
+        {
             let start = { self.lazy.lock().unwrap().p.next_absent(next, blocks) };
             let Some(b) = start.or_else(|| self.lazy.lock().unwrap().p.next_absent(0, blocks)) else { break };
             let t0 = Instant::now();
@@ -546,6 +712,8 @@ impl Dev {
             absent_blocks: self.lazy.lock().unwrap().p.absent(),
             fetched_bytes: s.fetched_bytes.load(Relaxed),
             fetch_errors: s.fetch_errors.load(Relaxed),
+            cached_bytes: self.cached_bytes(),
+            evicted_bytes: s.evicted_bytes.load(Relaxed),
         }
     }
 
@@ -936,6 +1104,13 @@ impl Dev {
         for &(b, n) in runs {
             let (off, len) = (b * crate::extmap::BLOCK, n as u64 * crate::extmap::BLOCK);
             let mut o = self.open.lock().unwrap();
+            // under the open-segment lock nothing is evicted; skip a run evicted since it was chosen
+            if !self.fully_present.load(Acquire) {
+                let l = self.lazy.lock().unwrap();
+                if !(b..b + n as u64).all(|x| l.p.is_present(x)) {
+                    continue;
+                }
+            }
             let range = self.intent_begin(off, len)?;
             buf.resize(len as usize, 0);
             rd.read_exact_at(&mut buf, off)?;
@@ -973,6 +1148,13 @@ impl Dev {
     /// the old checkpoints. Finally list what is left and check it opens with the current key.
     /// Tombstones and epoch markers are never read, so they may keep an old key.
     pub fn rekey(&self) -> Result<String> {
+        self.evict_paused.store(true, SeqCst);
+        let r = self.rekey_inner();
+        self.evict_paused.store(false, SeqCst);
+        r
+    }
+
+    fn rekey_inner(&self) -> Result<String> {
         let t0 = Instant::now();
         let bs = crate::extmap::BLOCK;
         let blocks = self.size.div_ceil(bs);

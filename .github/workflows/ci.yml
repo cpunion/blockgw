@@ -105,6 +105,8 @@ jobs:
           - { name: "remote, encrypted", slug: remote-encrypted, script: torture.py, args: --policy remote --encrypt }
           - { name: "XFS, local policy", slug: fs-local, script: fstorture.py, args: --policy local }
           - { name: "XFS, remote policy", slug: fs-remote, script: fstorture.py, args: --policy remote }
+          - { name: "remote, 4 writers, 16 MiB cache", slug: cache, script: torture.py, args: --policy remote --threads 4 --cache-mb 16 }
+          - { name: "XFS, local policy, 32 MiB cache", slug: fs-cache, script: fstorture.py, args: --policy local --cache-mb 32 }
           - { name: "takeovers, local policy", slug: fence-local, script: fencetorture.py, args: --policy local }
           - { name: "takeovers, remote policy", slug: fence-remote, script: fencetorture.py, args: --policy remote }
     steps:

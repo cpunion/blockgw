@@ -159,11 +159,13 @@ def copy_store(src, dst):
     raise RuntimeError("could not take a consistent store copy in 20 attempts")
 
 
-def write_config(path, store, image_dir, dev_id, policy, key_file=None):
+def write_config(path, store, image_dir, dev_id, policy, key_file=None, cache_mb=0):
     dev = {"id": dev_id, "size_gb": 1, "dir": image_dir, "prefix": "torture/d", "policy": policy,
            "checkpoint_every": 8}  # frequent checkpoints keep GC busy
     if key_file:
         dev["key_file"] = key_file
+    if cache_mb:
+        dev["cache_mb"] = cache_mb
     json.dump({"local_store": store, "control_socket": path.replace(".json", ".sock"), "upload_workers": 8,
                "devices": [dev]}, open(path, "w"))
 
@@ -184,11 +186,12 @@ def main():
     ap.add_argument("--upload-error-pct", type=int, default=10)
     ap.add_argument("--encrypt", action="store_true", help="encrypt the disk (key_file)")
     ap.add_argument("--threads", type=int, default=1, help="concurrent writer threads")
+    ap.add_argument("--cache-mb", type=int, default=0, help="local cache budget: evict while writing and reading")
     ap.add_argument("--max-copies", type=int, default=30, help="store copies kept and checked (a uniform sample)")
     a = ap.parse_args()
     blockgw = os.path.abspath(a.blockgw)
     rng = random.Random(a.seed)
-    work = os.path.join(a.work, f"{a.policy}{'-enc' if a.encrypt else ''}-t{a.threads}-{a.seed}")
+    work = os.path.join(a.work, f"{a.policy}{'-enc' if a.encrypt else ''}-t{a.threads}{f'-c{a.cache_mb}' if a.cache_mb else ''}-{a.seed}")
     shutil.rmtree(work, ignore_errors=True)
     os.makedirs(work)
     log(f"seed={a.seed} policy={a.policy} threads={a.threads} encrypt={a.encrypt} seconds={a.seconds} work={work}")
@@ -200,7 +203,7 @@ def main():
 
     store = os.path.join(work, "store")
     cfg = os.path.join(work, "main.json")
-    write_config(cfg, store, os.path.join(work, "img"), a.id, a.policy, key_file)
+    write_config(cfg, store, os.path.join(work, "img"), a.id, a.policy, key_file, a.cache_mb)
     srv = Server(blockgw, cfg, ["--orphan-timeout", "120"], {"BLOCKGW_FAILPOINTS": f"upload=error%{a.upload_error_pct}"})
     used_ids = [a.id]
     failures = []

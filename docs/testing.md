@@ -75,6 +75,7 @@ CI runs the unit layer and the end-to-end suite on every pull request
 | `22_local_batching` | under `local`, 300 synchronous 4 KiB writes cost a handful of PUTs (1 in practice) and reach the store within the interval without a drain; with `seal_interval_ms: 0` and under `remote` every flush seals |
 | `23_attach_detach` | with `devices_dir`: attach; detach refused while mounted; detach and re-attach reuses the local image; detach with `purge` and re-attach restores lazily from the store; a worker crash re-attaches from `devices_dir`; conflicting ids or prefixes are refused |
 | `24_key_rotation` | a disk written under key A opens with key B plus A as an old key; B alone cannot open it, and that failed open does not fence the live writer; `rekey` rewrites the old data; B alone then restores the whole device on a fresh host |
+| `25_cache_eviction` | with `cache_mb=48`, writing 160+ MiB leaves the image within the budget; the big file and a tree read back correctly after eviction, across a worker kill and after a restart |
 
 Failpoints (`src/failpoint.rs`) let a case make the server fail at a named place:
 
@@ -248,6 +249,8 @@ test for 45 minutes and the 4-writer, XFS and takeover tortures for 20 minutes e
 | remote, encrypted | `torture.py --policy remote --encrypt` |
 | XFS, local policy | `fstorture.py --policy local` |
 | XFS, remote policy | `fstorture.py --policy remote` |
+| remote, 4 writers, 16 MiB cache | `torture.py --policy remote --threads 4 --cache-mb 16` |
+| XFS, local policy, 32 MiB cache | `fstorture.py --policy local --cache-mb 32` |
 | takeovers, local policy | `fencetorture.py --policy local` |
 | takeovers, remote policy | `fencetorture.py --policy remote` |
 
