@@ -199,10 +199,33 @@ Its first run found a lazy-restore bug: after a worker crash, recovery re-upload
 keeping later ones. See §3.5b of the design; e2e case `21_lazy_crash_order` reproduces it
 deterministically.
 
+## Soak test
+
+`tests/soak/soak.py` runs XFS on three disks for a long time (45 minutes in the scheduled job)
+while worker threads overwrite, append to and delete files within a fixed amount of live data
+(128 MiB per disk), with fsyncs and occasional `fstrim`; the worker is killed every 5 minutes. It
+samples worker RSS, open descriptors, threads and the store's size per disk.
+
+Checks:
+
+1. **Memory**: worker RSS, minus the segment bytes it holds by design (queued for upload and the
+   open segment), ends at most 25% + 16 MiB above its level after the warm-up.
+2. **Descriptors and threads** do not grow.
+3. **Bounded store**: with constant live data, GC keeps each disk's stored bytes below 4× its
+   live data + 64 MiB.
+4. Every disk restores to a filesystem that `xfs_repair -n` finds clean, with its fsynced files
+   intact.
+
+Its first run measured 110–140 MiB of worker RSS (beyond held segments) for three disks: glibc's
+per-thread malloc arenas keeping freed segment buffers. blockgw now limits glibc to two arenas at
+startup, and the same run measures 50–56 MiB. A 6-minute run with three disks keeps about 6,400
+segments (1.3–1.5× the live data) per disk in the store.
+
 ## In CI
 
 Each pull request runs the torture tests for 90 s each, with the run id as seed, so every run
-explores a different schedule:
+explores a different schedule. A daily workflow (`soak.yml`, also started by hand) runs the soak
+test for 45 minutes and the 4-writer, XFS and takeover tortures for 20 minutes each.
 
 | Job | Script and options |
 |---|---|
@@ -239,4 +262,3 @@ Results land in `$BENCH_DIR/results/bench.tsv`. The October 2026 numbers are in
   Ubuntu do not package fsstress).
 - Object stores other than SeaweedFS (in CI) and AWS S3 (benchmarks). Aliyun OSS's
   `x-oss-forbid-overwrite` path is untested.
-- Long-running soak tests and memory-growth tracking.
