@@ -28,7 +28,6 @@ pub const REGION: u64 = 4 << 20; // write-intent granularity
 pub const MAX_SEG: usize = 16 << 20; // seal early above this
 pub const WINDOW: u64 = 8; // concurrent PUTs per disk
 pub const FENCE_SPAN: u64 = 2 * WINDOW; // seqs past the old writer's max that a new writer tombstones
-pub const RECOVERY_LAG: u64 = 64 << 20; // queue bound while re-uploading after a crash
 pub const POLICY_LOCAL: u8 = 0;
 pub const POLICY_REMOTE: u8 = 1;
 
@@ -306,7 +305,12 @@ impl Dev {
     }
 
     /// Re-upload what a crashed run left behind: the data extents of each dirty region (holes become
-    /// discards, found with SEEK_DATA/SEEK_HOLE), with backpressure. Runs before the device is attached.
+    /// discards, found with SEEK_DATA/SEEK_HOLE). Runs before the device is attached.
+    ///
+    /// Everything goes into a single segment. Uploaded piecewise, a host lost halfway through would
+    /// leave a log whose prefix mixes regions at the crash-time state with regions at an older state,
+    /// which is not a state the disk was ever in. The segment's size is the dirty data, which write-
+    /// intent tracking keeps close to the upload lag at the time of the crash.
     pub fn recover(&self) -> Result<()> {
         let regions = std::mem::take(&mut *self.pending_recovery.lock().unwrap());
         if regions.is_empty() {
@@ -317,15 +321,18 @@ impl Dev {
         let fd = rd.as_raw_fd();
         let (mut data_bytes, mut holes) = (0u64, 0u64);
         let mut buf = vec![0u8; 1 << 20];
+        let mut o = self.open.lock().unwrap();
+        let seq = self.next_seq.load(SeqCst); // the open segment is empty: the device is not attached yet
+        let mut ranges = Vec::with_capacity(regions.len());
         for r in &regions {
             let (start, end) = (r * REGION, ((r + 1) * REGION).min(self.size));
-            let range = self.intent_begin(start, end - start)?;
-            let (mut pos, mut last) = (start, 0);
+            ranges.push(self.intent_begin(start, end - start)?);
+            let mut pos = start;
             while pos < end {
                 let d = unsafe { libc::lseek(fd, pos as i64, libc::SEEK_DATA) };
                 let dstart = if d < 0 { end } else { (d as u64).min(end) };
                 if dstart > pos {
-                    last = self.append_discard(pos, (dstart - pos) as u32);
+                    o.push_discard(pos, (dstart - pos) as u32);
                     holes += 1;
                 }
                 if dstart >= end {
@@ -337,36 +344,31 @@ impl Dev {
                 while p < dend {
                     let n = ((dend - p) as usize).min(buf.len());
                     rd.read_exact_at(&mut buf[..n], p)?;
-                    last = self.append_data(p, &buf[..n]);
+                    o.push_data(p, &buf[..n]);
                     data_bytes += n as u64;
                     p += n as u64;
                 }
                 pos = dend;
             }
-            self.intent_end(range, Some(last));
-            self.wait_queue_below(RECOVERY_LAG);
         }
+        drop(o);
         let need = self.seal();
+        for range in ranges {
+            self.intent_end(range, Some(seq));
+        }
         let mut q = self.queue.lock().unwrap();
         while self.committed.load(SeqCst) < need && !self.fenced.load(SeqCst) {
             q = self.queue_cv.wait(q).unwrap();
         }
         drop(q);
         crate::info!(
-            "disk {}: recovery re-uploaded {} regions ({} MiB data, {holes} holes) in {} ms",
+            "disk {}: recovery re-uploaded {} regions ({} MiB data, {holes} holes) as one segment in {} ms",
             self.cfg.id,
             regions.len(),
             data_bytes >> 20,
             t0.elapsed().as_millis()
         );
         Ok(())
-    }
-
-    fn wait_queue_below(&self, limit: u64) {
-        let mut q = self.queue.lock().unwrap();
-        while q.bytes > limit && !self.fenced.load(SeqCst) {
-            q = self.queue_cv.wait(q).unwrap();
-        }
     }
 
     pub fn queued_bytes(&self) -> u64 {

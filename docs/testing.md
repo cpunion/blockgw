@@ -6,6 +6,7 @@ There are three layers:
 |---|---|---|---|
 | Unit | pure logic: segment format, replay and fencing rules, write-intent tracking, in-order commit | Linux (the crate links libublk) | `cargo test` |
 | End-to-end | real ublk devices, a real filesystem (XFS), a real S3 API (SeaweedFS by default) | root, `ublk_drv`, xfsprogs, python3, docker (or `S3_ENDPOINT`) | `sudo tests/e2e/run.sh` |
+| Torture | crash consistency under random worker kills, random upload failures and store copies taken at random instants | root, `ublk_drv`, python3 | `sudo tests/torture/torture.py --blockgw target/release/blockgw --policy local` |
 | Benchmark | the same workload on ext4, loop+XFS and blockgw, plus durability, multi-disk, idle, crash and restore measurements | a disposable host and a bucket | `S3_CONFIG=s3.json sudo -E bench/bench.sh` |
 
 CI runs the unit layer and the end-to-end suite on every pull request
@@ -89,6 +90,35 @@ docker run --rm --privileged --network container:e2e-s3 -v /dev:/dev -v "$PWD":/
 The VM's kernel must provide `ublk_drv` (OrbStack does). The binary must be built for Linux, for
 example inside a `rust` container.
 
+## Torture test
+
+`tests/torture/torture.py` drives a blockgw device with a local-directory store.
+
+- **Workload**: a single writer issues O_DIRECT 4 KiB writes to random blocks of a 64 MiB working
+  set, one at a time, with an fsync after about 5% of them. Every block carries
+  `(block, global write id, crc32)`.
+- **Faults injected meanwhile**:
+  - the worker is `SIGKILL`ed every 0.5–2 s; the supervisor restarts it;
+  - 10% of uploads fail (`upload=error%10`) and are retried;
+  - every 1–3 s the store directory is copied. Objects are immutable once created, so a copy is
+    exactly what a host that died at that instant would leave behind.
+
+Checks:
+
+1. **No write is lost across worker crashes**: the device ends with the last version of every block.
+2. **Every copy restores to a crash-consistent image**, with no torn block. Because writes are
+   issued one at a time, the restored image must equal the state after exactly the first K writes,
+   for some K.
+3. **Under `remote`**, K covers every write acknowledged by an fsync that returned before the copy
+   started.
+
+On failure it prints the seed; rerun with `--seed N --policy P` to reproduce. CI runs 90 s per
+policy, with the run id as seed, so every run explores a different schedule.
+
+This test drove one design fix. Crash-recovery re-uploads used to be split into 16 MiB segments; a
+host lost halfway through that upload would leave a prefix mixing crash-time and older regions.
+Recovery now uploads one atomic segment.
+
 ## Benchmark
 
 `bench/bench.sh` creates and deletes ublk and loop devices; run it only on a disposable host. Its
@@ -109,9 +139,9 @@ Results land in `$BENCH_DIR/results/bench.tsv`. The October 2026 numbers are in
 
 ## Not covered yet
 
-- A systematic crash-consistency matrix: crashes injected at every step of the write, seal, upload
-  and commit paths, combined with object-store faults. A torture tester in the style of lab47/lsvd's
-  is planned.
+- Concurrent writers (the torture test is single-writer, queue depth 1, so its prefix check can be
+  exact) and filesystem-level torture (fsstress / xfstests on top of blockgw).
+- Fencing races under torture (two servers on one disk while faults are injected).
 - Object stores other than SeaweedFS (in CI) and AWS S3 (benchmarks). Aliyun OSS's
   `x-oss-forbid-overwrite` path is untested.
 - Long-running soak tests and memory-growth tracking.
