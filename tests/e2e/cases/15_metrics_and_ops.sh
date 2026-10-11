@@ -1,6 +1,6 @@
 # Operability: Prometheus metrics over HTTP and over the control socket, JSON stats, config checks.
 port=$((19000 + ID_BASE % 1000))
-METRICS_ADDR=127.0.0.1:$port cfg=$(write_config a 1 2)
+cfg=$(METRICS_ADDR=127.0.0.1:$port write_config a 1 2)
 start_server "$cfg"
 id=$(cfg_ids "$cfg")
 m() { curl -sf "http://127.0.0.1:$port/metrics"; }

@@ -1,6 +1,6 @@
 # Garbage collection: after many overwrites, GC rounds delete the dead segments and repack sparse
 # ones; tombstones and the restorable state survive.
-CKPT_EVERY=4 cfg=$(write_config a 1 2)
+cfg=$(CKPT_EVERY=4 write_config a 1 2)
 start_server "$cfg"
 id=$(cfg_ids "$cfg")
 mkfs_mount "$id" "$W/m"
@@ -25,6 +25,6 @@ assert_gt "$deleted" 5 "segments deleted by gc"
 if [ "${E2E_STORE:-s3}" = dir ]; then
   assert_eq "$(count)" "$((puts - deleted))" "segment objects left = uploaded - deleted"
 fi
-DISK_KEYS="a-d0" r=$(write_config r 1 2)
+r=$(DISK_KEYS="a-d0" write_config r 1 2)
 start_server "$r"
 assert_eq "$(dev_hash "$(cfg_ids "$r")")" "$(file_hash "$(image a 0)")" "restored image after gc"

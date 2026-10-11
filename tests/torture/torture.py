@@ -114,10 +114,13 @@ def copy_store(src, dst):
         cp(p)
 
 
-def write_config(path, store, image_dir, dev_id, policy):
+def write_config(path, store, image_dir, dev_id, policy, key_file=None):
+    dev = {"id": dev_id, "size_gb": 1, "dir": image_dir, "prefix": "torture/d", "policy": policy,
+           "checkpoint_every": 8}  # frequent checkpoints keep GC busy
+    if key_file:
+        dev["key_file"] = key_file
     json.dump({"local_store": store, "control_socket": path.replace(".json", ".sock"), "upload_workers": 8,
-               "devices": [{"id": dev_id, "size_gb": 1, "dir": image_dir, "prefix": "torture/d", "policy": policy,
-                            "checkpoint_every": 8}]}, open(path, "w"))  # frequent checkpoints keep GC busy
+               "devices": [dev]}, open(path, "w"))
 
 
 def delete_device(blockgw, dev_id):
@@ -134,17 +137,23 @@ def main():
     ap.add_argument("--id", type=int, default=1500)
     ap.add_argument("--work", default="/tmp/blockgw-torture")
     ap.add_argument("--upload-error-pct", type=int, default=10)
+    ap.add_argument("--encrypt", action="store_true", help="encrypt the disk (key_file)")
     a = ap.parse_args()
     blockgw = os.path.abspath(a.blockgw)
     rng = random.Random(a.seed)
-    work = os.path.join(a.work, f"{a.policy}-{a.seed}")
+    work = os.path.join(a.work, f"{a.policy}{'-enc' if a.encrypt else ''}-{a.seed}")
     shutil.rmtree(work, ignore_errors=True)
     os.makedirs(work)
-    log(f"seed={a.seed} policy={a.policy} seconds={a.seconds} work={work}")
+    log(f"seed={a.seed} policy={a.policy} encrypt={a.encrypt} seconds={a.seconds} work={work}")
+    key_file = None
+    if a.encrypt:
+        key_file = os.path.join(work, "disk.key")
+        with open(os.open(key_file, os.O_WRONLY | os.O_CREAT, 0o600), "wb") as f:
+            f.write(os.urandom(32))
 
     store = os.path.join(work, "store")
     cfg = os.path.join(work, "main.json")
-    write_config(cfg, store, os.path.join(work, "img"), a.id, a.policy)
+    write_config(cfg, store, os.path.join(work, "img"), a.id, a.policy, key_file)
     srv = Server(blockgw, cfg, ["--orphan-timeout", "120"], {"BLOCKGW_FAILPOINTS": f"upload=error%{a.upload_error_pct}"})
     used_ids = [a.id]
     failures = []
@@ -216,7 +225,7 @@ def main():
             used_ids.append(rid)
             rcfg = os.path.join(work, f"restore{k}.json")
             rimg = os.path.join(work, f"rimg{k}")
-            write_config(rcfg, snap, rimg, rid, "local")
+            write_config(rcfg, snap, rimg, rid, "local", key_file)
             r = Server(blockgw, rcfg, ["--no-supervisor"])
             try:
                 r.wait_ready(rid)

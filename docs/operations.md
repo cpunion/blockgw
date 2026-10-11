@@ -80,7 +80,24 @@ Suggested alerts:
 | `repack_budget_mb` | 64 | live data rewritten per GC round |
 | `lazy` | `true` | on restore, serve the device at once and fetch blocks on first read |
 | `hydrate_mbps` | 64 | background hydration rate after a lazy restore (0 = on demand only) |
+| `key_file` | none | encrypt every object of the disk with the 32-byte key in this file |
 | `depth`, `queues` | 32, 1 | ublk queue depth and number of queues |
+
+## Encryption keys
+
+```sh
+install -m 600 /dev/null /etc/blockgw/keys/d0.key
+head -c 32 /dev/urandom > /etc/blockgw/keys/d0.key   # or 64 hex digits
+```
+
+- Set `"key_file": "/etc/blockgw/keys/d0.key"` on the disk **before its first start**. An existing
+  disk's key cannot be added, changed or removed: the server refuses to open a disk whose objects
+  do not match its key setting.
+- The file must not be readable by group or others; `check-config` and the server refuse it
+  otherwise.
+- Keep a copy of the key outside the host (a secrets manager). Without it the disk cannot be
+  restored anywhere.
+- One key may be shared by several disks.
 
 ## Logs
 

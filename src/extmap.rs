@@ -157,6 +157,7 @@ impl ExtentMap {
 
     /// Load a checkpoint into this (fresh) map; returns the log position it reflects.
     pub fn load_checkpoint(&mut self, obj: &[u8]) -> Result<(u64, u64)> {
+        ensure!(!crate::crypt::looks_encrypted(obj), "the checkpoint is encrypted, but this disk has no key_file");
         ensure!(obj.len() >= 28 && &obj[0..4] == b"BGC2", "not a checkpoint");
         let u64at = |b: &[u8], p: usize| u64::from_le_bytes(b[p..p + 8].try_into().unwrap());
         let u32at = |b: &[u8], p: usize| u32::from_le_bytes(b[p..p + 4].try_into().unwrap());

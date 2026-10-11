@@ -68,6 +68,9 @@ pub struct DevConfig {
     /// background hydration rate after a lazy restore (0 = only on demand)
     #[serde(default = "default_hydrate")]
     pub hydrate_mbps: u64,
+    /// encrypt every object of this disk with the 32-byte key in this file (see crypt.rs)
+    #[serde(default)]
+    pub key_file: Option<String>,
 }
 fn default_hydrate() -> u64 {
     64
@@ -974,7 +977,7 @@ impl Pool {
     }
 
     /// Compress (skipped for incompressible data), create-only PUT, retry transient errors.
-    pub fn worker(&self, s3: &dyn Store) {
+    pub fn worker(&self) {
         loop {
             let (dev, seq, seg) = {
                 let mut j = self.jobs.lock().unwrap();
@@ -994,7 +997,7 @@ impl Pool {
                 if dev.fenced.load(SeqCst) {
                     break PutOutcome::Exists;
                 }
-                match s3.put_new(&key, &obj) {
+                match dev.store.put_new(&key, &obj) {
                     Ok(o) => {
                         dev.stats.upload_micros.fetch_add(t0.elapsed().as_micros() as u64, Relaxed);
                         break o;

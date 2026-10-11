@@ -95,9 +95,9 @@ ZeroFS ran on a 4-vCPU host and blockgw on a 3-vCPU host; ext4 is each host's ow
 ### Where ZeroFS is the better choice
 
 - You need file-level sharing (NFS / 9P).
-- Hosts cannot hold a full copy of each disk: ZeroFS keeps data in S3 with a bounded cache, while
-  the blockgw prototype needs the full image locally.
-- You need standby replication, garbage collection, checkpoints or encryption today.
+- Hosts cannot hold a full copy of each disk: ZeroFS keeps data in S3 with a bounded cache. blockgw
+  restores lazily, but hydrates to the full image and has no eviction yet.
+- You need standby replication today.
 
 ## Block-per-object designs (s3backer, nbdkit S3)
 
