@@ -15,8 +15,8 @@ You can restore a disk on any host from the log alone, and a second host that op
 out the first.
 
 > **Status: experimental prototype.** The write path, crash recovery and supervision, checkpointed
-> restore and fencing work and are covered by tests. Cold reads that fetch data lazily from S3,
-> garbage collection and encryption are not implemented yet. Do not use it for data you cannot afford to lose. See
+> restore, garbage collection and fencing work and are covered by tests. Cold reads that fetch data
+> lazily from S3, and encryption, are not implemented yet. Do not use it for data you cannot afford to lose. See
 > [Roadmap](#roadmap).
 
 ## Why
@@ -70,6 +70,9 @@ the durable, mobile copy, and it lets each disk choose when an `fsync` must reac
   - A restore loads the newest checkpoint, fetches only the live data with ranged GETs, then replays
     the segments after it.
   - After heavy overwriting it downloads what is current, not the history.
+- **Garbage collection**: after each checkpoint, segments that neither of the last two checkpoints
+  references are deleted, and sparse segments are repacked. Storage tracks live data, not
+  history. Tombstones are kept forever, so a fenced writer always collides.
 - **Crash recovery**: `blockgw serve` is a small supervisor around a worker process.
   - If the worker dies, the kernel keeps the device and queues its I/O (`UBLK_F_USER_RECOVERY`).
     The supervisor restarts the worker at once, and the new worker re-attaches the device.
@@ -153,10 +156,10 @@ On macOS or Windows, run blockgw in a Linux VM; see [docs/local-dev.md](docs/loc
 
 - `cargo test`: unit tests for the segment format, replay and fencing rules, write-intent tracking
   and in-order commit.
-- `sudo tests/e2e/run.sh`: sixteen end-to-end cases against real ublk devices, with a local
+- `sudo tests/e2e/run.sh`: seventeen end-to-end cases against real ublk devices, with a local
   SeaweedFS or (`E2E_STORE=dir`) a local-directory store (crash recovery, supervisor restart, orphan
   timeout, graceful drain, restore, fencing, policy switch, discard, multi-disk, idle requests,
-  metrics, checkpoint restore, ...).
+  metrics, checkpoint restore, garbage collection, ...).
 - `sudo tests/torture/torture.py`: crash-consistency torture. Random worker kills, random upload
   failures and store copies taken at random instants; every copy must restore to an exact prefix
   of the writes, with nothing lost that `remote` acknowledged.
@@ -166,13 +169,12 @@ See [docs/testing.md](docs/testing.md).
 
 ## Roadmap
 
-1. Lazy cold reads: fetch byte ranges of segments on demand, so a host needs only a cache rather
-   than the full image.
-2. Garbage collection and repacking of dead segments, using the checkpointed extent map.
-3. Encryption at rest (per-disk keys).
-4. Optional streaming of unflushed writes to a standby.
-5. Zero-copy ublk (Linux 6.15+); concurrent-writer and filesystem-level (fsstress) torture.
-6. Native macOS and Windows frontends (research: an iSCSI target for Windows' built-in initiator;
+1. Lazy cold reads: fetch byte ranges of segments on demand (the format and the extent map already
+   allow it), so a host needs only a cache rather than the full image.
+2. Encryption at rest (per-disk keys, per frame).
+3. Optional streaming of unflushed writes to a standby.
+4. Zero-copy ublk (Linux 6.15+); concurrent-writer and filesystem-level (fsstress) torture.
+5. Native macOS and Windows frontends (research: an iSCSI target for Windows' built-in initiator;
    an FSKit-served image file attached with `hdiutil` on macOS).
 
 ## Contributing

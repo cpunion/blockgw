@@ -25,7 +25,7 @@ write_config() {
     key=${keys[$i]:-$name-d$i}
     id=$((ID_BASE + $(wc -l < "$W/ids")))
     echo "$id" >> "$W/ids"
-    devs+="${devs:+,}{\"id\":$id,\"size_gb\":$size,\"dir\":\"$W/$name/d$i\",\"prefix\":\"$PREFIX/$key\",\"policy\":\"$policy\"}"
+    devs+="${devs:+,}{\"id\":$id,\"size_gb\":$size,\"dir\":\"$W/$name/d$i\",\"prefix\":\"$PREFIX/$key\",\"policy\":\"$policy\"${CKPT_EVERY:+,\"checkpoint_every\":$CKPT_EVERY}}"
   done
   local store
   if [ "${E2E_STORE:-s3}" = dir ]; then
@@ -104,8 +104,11 @@ PY
 tree_hash() { (cd "$1" && find . -type f -print0 | sort -z | xargs -0 sha256sum | sha256sum | cut -c1-16); }
 rand_file() { head -c "$2" /dev/urandom > "$1"; }   # rand_file PATH BYTES
 file_hash() { sha256sum "$1" | cut -c1-16; }
-kernel_errors() { dmesg 2>/dev/null | grep -ciE "ublk.*(error|fail)|XFS \(ublkb.*(shut|error|corrupt)" || true; }
-mark_dmesg() { dmesg -C 2>/dev/null || true; }
+# never clear the kernel ring buffer (other cases and later debugging need it): remember a position
+mark_dmesg() { DMESG_MARK=$(dmesg 2>/dev/null | wc -l); }
+kernel_errors() { dmesg 2>/dev/null | tail -n +$(( ${DMESG_MARK:-0} + 1 )) | grep -ciE "ublk.*(error|fail)|XFS \(ublkb.*(shut|error|corrupt)" || true; }
+# umount that fails the case instead of silently leaving dirty data in the page cache
+umount_ok() { umount "$1" || fail "umount $1 failed: $(fuser -vm "$1" 2>&1 | tail -3)"; }
 
 # cleanup: unmount, stop servers, delete devices. Safe to run repeatedly.
 cleanup() {

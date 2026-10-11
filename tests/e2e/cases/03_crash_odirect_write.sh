@@ -16,7 +16,7 @@ wait $dp
 assert_eq "$(cat "$W/dd.rc")" 0 "dd exit status"
 assert_eq "$(file_hash "$W/m/f.bin")" "$(file_hash "$W/src.bin")" "file content"
 assert_eq "$(kernel_errors)" 0 "kernel I/O errors"
-umount "$W/m"; drain "$cfg" "$id"
+umount_ok "$W/m"; drain "$cfg" "$id"
 DISK_KEYS="a-d0" r=$(write_config r 1 8)
 start_server "$r"
 assert_eq "$(file_hash "$(image r 0)")" "$(file_hash "$(image a 0)")" "object store converged to the local image"

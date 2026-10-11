@@ -6,7 +6,7 @@ mkfs_mount "$id" "$W/m"
 gen_tree "$W/m/tree" 2000 2
 rand_file "$W/m/big.bin" $((48 << 20))
 h=$(tree_hash "$W/m/tree"); hb=$(file_hash "$W/m/big.bin")
-umount "$W/m"                       # unmount writes too: drain after it
+umount_ok "$W/m"                       # unmount writes too: drain after it
 drain "$cfg" "$id"
 a=$(file_hash "$(image a 0)")
 DISK_KEYS="a-d0" r=$(write_config r 1 4)

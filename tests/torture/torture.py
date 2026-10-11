@@ -6,7 +6,9 @@ with random fsyncs. Each block it writes carries (block, global write id, checks
   * the worker process is killed with SIGKILL at random intervals (the supervisor restarts it),
   * uploads fail at random (failpoint `upload=error%P`; they are retried),
   * the local-directory object store is copied at random moments. A copy is what a host that died
-    at that instant would leave behind in the object store.
+    at that instant would leave behind in the object store,
+  * checkpoints are taken every 8 segments, so garbage collection deletes and repacks segments
+    throughout.
 
 Checks:
   1. no acknowledged write is lost across worker crashes: the device ends up holding, for every
@@ -69,9 +71,40 @@ class Server:
         return int(out[0]) if out else None
 
 
+def copy_store(src, dst):
+    """Copy a live store so that the copy is a state the store really passed through.
+
+    Objects are only ever created (immutable) or deleted by GC, and GC only deletes segments that
+    neither of the last two checkpoints references. So: list the checkpoints first, then copy the
+    segments (skipping any that vanish meanwhile), then copy only the checkpoints listed first.
+    A checkpoint written during the copy is left out; it could reference segments the copy missed.
+    """
+    def files(root):
+        for dirpath, _, names in os.walk(root):
+            for n in names:
+                if not n.startswith(".tmp."):
+                    yield os.path.join(dirpath, n)
+
+    def cp(path):
+        rel = os.path.relpath(path, src)
+        os.makedirs(os.path.join(dst, os.path.dirname(rel)), exist_ok=True)
+        try:
+            shutil.copyfile(path, os.path.join(dst, rel))
+        except FileNotFoundError:
+            pass  # deleted by GC after the listing
+
+    ckpts = [p for p in files(src) if "/ckpt/" in p]
+    for p in files(src):
+        if "/ckpt/" not in p:
+            cp(p)
+    for p in ckpts:
+        cp(p)
+
+
 def write_config(path, store, image_dir, dev_id, policy):
     json.dump({"local_store": store, "control_socket": path.replace(".json", ".sock"), "upload_workers": 8,
-               "devices": [{"id": dev_id, "size_gb": 1, "dir": image_dir, "prefix": "torture/d", "policy": policy}]}, open(path, "w"))
+               "devices": [{"id": dev_id, "size_gb": 1, "dir": image_dir, "prefix": "torture/d", "policy": policy,
+                            "checkpoint_every": 8}]}, open(path, "w"))  # frequent checkpoints keep GC busy
 
 
 def delete_device(blockgw, dev_id):
@@ -126,7 +159,7 @@ def main():
             while not stop.wait(rng.uniform(1.0, 3.0)):
                 acked = state["acked"]
                 dst = os.path.join(work, f"snap{n}")
-                shutil.copytree(store, dst, ignore=shutil.ignore_patterns(".tmp.*"))
+                copy_store(store, dst)
                 snaps.append((dst, acked))
                 n += 1
 

@@ -56,11 +56,11 @@ pub fn parse_ckpt_key(key: &str) -> Option<(u64, u64)> {
     (it.next()? == "ckpt").then_some((epoch, seq))
 }
 
-/// How many segments of one epoch form the replayable prefix, judged by key presence only:
-/// `seqs` must be sorted; the prefix is 0, 1, 2, ... up to the first gap. (Replay additionally
-/// stops at the first tombstone, which is only known after fetching.)
-pub fn contiguous_prefix(seqs: &[u64]) -> usize {
-    seqs.iter().enumerate().take_while(|(i, s)| **s == *i as u64).count()
+/// How many of `seqs` (sorted) form the run `start, start + 1, ...`. Replay of an epoch takes this
+/// run, by key presence, and additionally stops at the first tombstone, which is only known after
+/// fetching. Below a checkpoint, GC may have removed dead segments, so the run starts after it.
+pub fn contiguous_from(seqs: &[u64], start: u64) -> usize {
+    seqs.iter().enumerate().take_while(|(i, s)| **s == start + *i as u64).count()
 }
 
 /// Keys a new writer must occupy (with tombstones) in the previous epoch so that every PUT the old
@@ -93,10 +93,11 @@ mod tests {
 
     #[test]
     fn prefix_stops_at_first_gap() {
-        assert_eq!(contiguous_prefix(&[]), 0);
-        assert_eq!(contiguous_prefix(&[0, 1, 2]), 3);
-        assert_eq!(contiguous_prefix(&[0, 1, 3, 4]), 2);
-        assert_eq!(contiguous_prefix(&[1, 2]), 0);
+        assert_eq!(contiguous_from(&[], 0), 0);
+        assert_eq!(contiguous_from(&[0, 1, 2], 0), 3);
+        assert_eq!(contiguous_from(&[0, 1, 3, 4], 0), 2);
+        assert_eq!(contiguous_from(&[1, 2], 0), 0);
+        assert_eq!(contiguous_from(&[5, 6, 8], 5), 2);
     }
 
     #[test]

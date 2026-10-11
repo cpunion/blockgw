@@ -13,7 +13,7 @@ kill9_all "$cfg"; start_server "$cfg"
 wait $cp_pid
 assert_eq "$(cat "$W/cp.rc")" 0 "copy + sync exit status"
 assert_eq "$(tree_hash "$W/m/copy")" "$h" "tree after crash"
-umount "$W/m"; drain "$cfg" "$id"
+umount_ok "$W/m"; drain "$cfg" "$id"
 DISK_KEYS="a-d0" r=$(write_config r 1 4)
 start_server "$r"
 assert_eq "$(file_hash "$(image r 0)")" "$(file_hash "$(image a 0)")" "object store converged"

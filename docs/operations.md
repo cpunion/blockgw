@@ -25,7 +25,8 @@
 | `metrics` | the same Prometheus text the HTTP endpoint serves |
 | `policy <id> local\|remote` | switch the durability policy at runtime |
 | `lag <id> <MiB>` | change the upload lag limit for the `local` policy |
-| `drain <id>` | seal the open segment and wait until everything is committed |
+| `drain <id>` | seal the open segment, wait until everything is committed, then write a checkpoint |
+| `gc <id>` | drain, checkpoint, then run one garbage-collection round now |
 
 ## Metrics
 
@@ -50,6 +51,8 @@ Per-disk series carry a `disk` label.
 | `blockgw_flush_wait_seconds_total` | counter | time flushes waited for uploads (`remote`, or lag backpressure) |
 | `blockgw_intent_syncs_total` | counter | write-intent bitmap fdatasyncs |
 | `blockgw_lag_waits_total` | counter | times writers or flushes waited for the lag to shrink |
+| `blockgw_gc_deleted_segments_total`, `blockgw_gc_deleted_bytes_total` | counter | segment objects, and their bytes, deleted by GC |
+| `blockgw_gc_repacked_bytes_total` | counter | live bytes rewritten out of sparse segments |
 
 Suggested alerts:
 
@@ -60,6 +63,18 @@ Suggested alerts:
 | `rate(blockgw_upload_errors_total[5m]) > 0` for a while | the object store is unreachable or rejecting writes |
 | `rate(blockgw_flush_wait_seconds_total[5m]) / rate(blockgw_flushes_total[5m])` rising | fsync latency is rising: `remote` policy, or backpressure |
 | supervisor log lines `worker exited` or `orphan timeout` | the worker is crashing |
+
+## Per-disk settings
+
+| Key | Default | Meaning |
+|---|---|---|
+| `policy` | `local` | durability policy at start (switchable at runtime) |
+| `max_lag_mb` | 16 | upload lag allowed under `local` before writers wait |
+| `checkpoint_every` | 64 | committed segments between checkpoints (also every 60 s if anything committed) |
+| `gc` | `true` | run garbage collection after each checkpoint |
+| `repack_ratio` | 0.5 | repack segments whose live fraction is below this |
+| `repack_budget_mb` | 64 | live data rewritten per GC round |
+| `depth`, `queues` | 32, 1 | ublk queue depth and number of queues |
 
 ## Logs
 

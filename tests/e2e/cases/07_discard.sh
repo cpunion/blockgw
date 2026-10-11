@@ -14,7 +14,7 @@ for i in $(seq 1 10); do
   [ "$after" -lt $((before - 200000)) ] && break
   sleep 1
 done
-umount "$W/m"; drain "$cfg" "$id"
+umount_ok "$W/m"; drain "$cfg" "$id"
 after=$(du -k "$(image a 0)" | cut -f1)
 log "metric: image allocation ${before} KiB -> ${after} KiB after rm + fstrim"
 assert_lt "$after" $((before - 200000)) "fstrim released the file's blocks in the image"

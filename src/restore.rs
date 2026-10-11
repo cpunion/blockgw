@@ -53,13 +53,15 @@ pub fn plan(store: &dyn Store, prefix: &str, below_epoch: u64) -> Result<Plan> {
     let mut after = Vec::new();
     for (e, mut keys) in by_epoch {
         keys.sort();
-        let seqs: Vec<u64> = keys.iter().map(|(s, _)| *s).collect();
-        keys.truncate(log::contiguous_prefix(&seqs));
-        match &ckpt {
+        // only what follows the checkpoint must be contiguous: GC deletes dead segments below it
+        let start = match &ckpt {
             Some((_, (ce, _))) if e < *ce => continue, // covered by the checkpoint
-            Some((_, (ce, cs))) if e == *ce => keys.retain(|(s, _)| s > cs),
-            _ => {}
-        }
+            Some((_, (ce, cs))) if e == *ce => cs + 1,
+            _ => 0,
+        };
+        keys.retain(|(s, _)| *s >= start);
+        let seqs: Vec<u64> = keys.iter().map(|(s, _)| *s).collect();
+        keys.truncate(log::contiguous_from(&seqs, start));
         if !keys.is_empty() {
             after.push((e, keys));
         }
@@ -86,19 +88,18 @@ fn check_position(meta: &segment::Meta, e: u64, s: u64, key: &str) -> Result<()>
     Ok(())
 }
 
-/// Load the checkpoint (if any) into `map`.
-fn load_checkpoint(store: &dyn Store, plan: &Plan, map: &mut ExtentMap) -> Result<()> {
-    if let Some((key, pos)) = &plan.ckpt {
-        let got = map.load_checkpoint(&store.get(key)?).with_context(|| key.clone())?;
-        ensure!(got == *pos, "{key}: checkpoint says position {got:?}");
-    }
-    Ok(())
+/// Load the checkpoint (if any) into `map`; returns it as a GC reference point.
+fn load_checkpoint(store: &dyn Store, plan: &Plan, map: &mut ExtentMap) -> Result<Option<crate::gc::Checkpoint>> {
+    let Some((key, pos)) = &plan.ckpt else { return Ok(None) };
+    let got = map.load_checkpoint(&store.get(key)?).with_context(|| key.clone())?;
+    ensure!(got == *pos, "{key}: checkpoint says position {got:?}");
+    Ok(Some(crate::gc::Checkpoint { pos: *pos, referenced: map.referenced() }))
 }
 
-/// Rebuild only the extent map (the local image already holds the data). Returns segments applied.
-pub fn rebuild_map(store: &dyn Store, prefix: &str, plan: &Plan, map: &mut ExtentMap) -> Result<usize> {
-    let _ = prefix;
-    load_checkpoint(store, plan, map)?;
+/// Rebuild only the extent map (the local image already holds the data). Returns segments applied
+/// and the checkpoint it started from.
+pub fn rebuild_map(store: &dyn Store, plan: &Plan, map: &mut ExtentMap) -> Result<(usize, Option<crate::gc::Checkpoint>)> {
+    let ck = load_checkpoint(store, plan, map)?;
     let mut n = 0;
     for (e, keys) in &plan.after {
         for chunk in keys.chunks(16) {
@@ -121,7 +122,7 @@ pub fn rebuild_map(store: &dyn Store, prefix: &str, plan: &Plan, map: &mut Exten
             }
         }
     }
-    Ok(n)
+    Ok((n, ck))
 }
 
 /// Write the checkpoint's live runs into `image` with ranged GETs (16 segments in parallel).
@@ -147,36 +148,67 @@ fn fetch_live_runs(store: &dyn Store, prefix: &str, map: &ExtentMap, image: &Fil
     Ok(bytes)
 }
 
-/// Fetch the data runs `(data_block, count, disk_block)` of one segment, sorted by data_block.
+/// Frames whose gap is at most this many frames are fetched in one ranged GET.
+const MERGE_GAP_FRAMES: usize = 4;
+
+/// Group needed frame indexes (sorted) into spans, bridging gaps of up to `gap` frames; when more
+/// than half of all `total` frames are needed, one span covers the whole data.
+pub fn frame_spans(needed: &[usize], total: usize, gap: usize) -> Vec<std::ops::Range<usize>> {
+    if needed.is_empty() {
+        return Vec::new();
+    }
+    if needed.len() * 2 > total {
+        let whole = 0..total; // one span covering every frame
+        return vec![whole];
+    }
+    let mut spans: Vec<std::ops::Range<usize>> = Vec::new();
+    for &f in needed {
+        match spans.last_mut() {
+            Some(s) if f <= s.end + gap => s.end = s.end.max(f + 1),
+            _ => spans.push(f..f + 1),
+        }
+    }
+    spans
+}
+
+/// Fetch the data runs `(data_block, count, disk_block)` of one segment: the needed frames with as
+/// few ranged GETs as reasonable (see `frame_spans`), each frame decoded once.
 fn fetch_segment_runs(store: &dyn Store, key: &str, e: u64, s: u64, runs: &[(u32, u32, u64)], image: &File) -> Result<u64> {
     let meta = fetch_meta(store, key)?.with_context(|| format!("{key}: referenced by the checkpoint but is a tombstone"))?;
     check_position(&meta, e, s, key)?;
-    let mut bytes = 0u64;
-    let mut i = 0;
-    while i < runs.len() {
-        // group runs whose frames are adjacent or overlapping into one ranged GET
-        let first = meta.frames_for(runs[i].0 as u64 * BLOCK, runs[i].1 as u64 * BLOCK);
-        let mut frames = first.clone();
-        let mut j = i + 1;
-        while j < runs.len() {
-            let r = meta.frames_for(runs[j].0 as u64 * BLOCK, runs[j].1 as u64 * BLOCK);
-            if r.start > frames.end {
-                break;
+    let mut needed: Vec<usize> = runs.iter().flat_map(|&(d, n, _)| meta.frames_for(d as u64 * BLOCK, n as u64 * BLOCK)).collect();
+    needed.sort_unstable();
+    needed.dedup();
+    let mut raw: std::collections::HashMap<usize, Vec<u8>> = std::collections::HashMap::new();
+    for span in frame_spans(&needed, meta.frames.len(), MERGE_GAP_FRAMES) {
+        let (off, len) = segment::frames_span(&meta, &span);
+        let bytes = store.get_range(key, off, len)?;
+        ensure!(bytes.len() as u64 == len, "{key}: short ranged read");
+        for f in span.clone() {
+            if needed.binary_search(&f).is_ok() {
+                let fr = &meta.frames[f];
+                let at = (fr.obj_off - off) as usize;
+                raw.insert(f, segment::decode_frame(fr, &bytes[at..at + fr.obj_len as usize])?);
             }
-            frames.end = frames.end.max(r.end);
-            j += 1;
         }
-        let (off, len) = segment::frames_span(&meta, &frames);
-        let span = store.get_range(key, off, len)?;
-        ensure!(span.len() as u64 == len, "{key}: short ranged read");
-        for &(d, n, b) in &runs[i..j] {
-            let data = segment::read_data(&meta, &frames, &span, d as u64 * BLOCK, n as u64 * BLOCK)?;
-            image.write_all_at(&data, b * BLOCK)?;
-            bytes += data.len() as u64;
-        }
-        i = j;
     }
-    Ok(bytes)
+    let fs = meta.frame_size as u64;
+    let mut written = 0u64;
+    for &(d, n, b) in runs {
+        let (mut off, end) = (d as u64 * BLOCK, (d + n) as u64 * BLOCK);
+        let mut disk = b * BLOCK;
+        while off < end {
+            let f = (off / fs) as usize;
+            let frame = raw.get(&f).with_context(|| format!("{key}: frame {f} not fetched"))?;
+            let at = (off - f as u64 * fs) as usize;
+            let take = ((end - off) as usize).min(frame.len() - at);
+            image.write_all_at(&frame[at..at + take], disk)?;
+            off += take as u64;
+            disk += take as u64;
+            written += take as u64;
+        }
+    }
+    Ok(written)
 }
 
 /// Apply a whole segment object to the image and the map.
@@ -197,11 +229,12 @@ fn apply_object(obj: &[u8], e: u64, s: u64, key: &str, image: &File, map: &mut E
 pub struct Restored {
     pub live_bytes: u64,
     pub segments: usize,
+    pub ckpt: Option<crate::gc::Checkpoint>,
 }
 
 /// Rebuild `image` (expected empty) and `map` from the object store.
 pub fn restore_full(store: &dyn Store, prefix: &str, plan: &Plan, map: &mut ExtentMap, image: &File) -> Result<Restored> {
-    load_checkpoint(store, plan, map)?;
+    let ckpt = load_checkpoint(store, plan, map)?;
     let live_bytes = fetch_live_runs(store, prefix, map, image)?;
     let mut segments = 0;
     for (e, keys) in &plan.after {
@@ -220,7 +253,7 @@ pub fn restore_full(store: &dyn Store, prefix: &str, plan: &Plan, map: &mut Exte
             }
         }
     }
-    Ok(Restored { live_bytes, segments })
+    Ok(Restored { live_bytes, segments, ckpt })
 }
 
 /// True if some epoch in `(after_epoch, ..)` of the plan, or the checkpoint, carries data written
@@ -308,7 +341,10 @@ mod tests {
         assert_eq!(map.runs(), truth.runs());
 
         let mut map2 = ExtentMap::create(&r.join("map2"), size).unwrap();
-        assert_eq!(rebuild_map(&st, "d", &plan, &mut map2).unwrap(), 2);
+        let (n, ck) = rebuild_map(&st, &plan, &mut map2).unwrap();
+        assert_eq!(n, 2);
+        assert_eq!(ck.unwrap().pos, (1, 1));
+        assert_eq!(got.ckpt.unwrap().pos, (1, 1));
         assert_eq!(map2.runs(), truth.runs());
         assert!(has_foreign_data(&st, &plan, 1).unwrap(), "epoch 2 wrote data");
         assert!(!has_foreign_data(&st, &plan, 2).unwrap());
@@ -328,5 +364,28 @@ mod tests {
         let shape: Vec<(u64, Vec<u64>)> = p.after.iter().map(|(e, v)| (*e, v.iter().map(|(s, _)| *s).collect())).collect();
         assert_eq!(shape, vec![(1, vec![0, 1]), (2, vec![0])], "gap at 1/2 ends epoch 1; epoch 5 is excluded");
         std::fs::remove_dir_all(r).unwrap();
+    }
+
+    #[test]
+    fn segments_deleted_below_the_checkpoint_do_not_end_the_epoch() {
+        let r = root("gcgap");
+        let st = LocalDir::new(&r).unwrap();
+        let b = Builder::default();
+        for s in [3, 5, 6, 7, 9] {
+            put_seg(&st, 1, s, &b); // 0..=2 and 4 were collected; 8 is a real gap
+        }
+        st.put_new(&log::key_ckpt("d", 1, 4), b"x").unwrap();
+        let p = plan(&st, "d", 2).unwrap();
+        let seqs: Vec<u64> = p.after[0].1.iter().map(|(s, _)| *s).collect();
+        assert_eq!(seqs, vec![5, 6, 7]);
+        std::fs::remove_dir_all(r).unwrap();
+    }
+
+    #[test]
+    fn frame_spans_bridge_small_gaps_and_go_whole_when_dense() {
+        assert!(frame_spans(&[], 10, 4).is_empty());
+        assert_eq!(frame_spans(&[0, 2, 9], 40, 4), vec![0..3, 9..10]);
+        assert_eq!(frame_spans(&[0, 5, 30], 40, 4), vec![0..6, 30..31]);
+        assert_eq!(frame_spans(&[1, 3, 5, 7, 9, 11], 10, 0), vec![0..10], "more than half needed: one GET");
     }
 }
