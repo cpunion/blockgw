@@ -14,8 +14,8 @@ Its history is a strictly ordered log of segments uploaded to S3, R2, or any S3-
 You can restore a disk on any host from the log alone, and a second host that opens the disk fences
 out the first.
 
-> **Status: experimental prototype.** The write path, crash recovery, restore and fencing work and
-> are covered by tests. Cold reads that fetch data lazily from S3, garbage collection, checkpoints
+> **Status: experimental prototype.** The write path, crash recovery and supervision, restore and
+> fencing work and are covered by tests. Cold reads that fetch data lazily from S3, garbage collection, checkpoints
 > and encryption are not implemented yet. Do not use it for data you cannot afford to lose. See
 > [Roadmap](#roadmap).
 
@@ -64,8 +64,11 @@ the durable, mobile copy, and it lets each disk choose when an `fsync` must reac
 - **Crash-consistent object store**: segments are cut at flush boundaries and committed in sequence
   order. Any prefix of the log is therefore a state the disk could have crashed into. A new host
   replays the prefix up to the first gap or tombstone.
-- **Crash recovery**: if the process dies, the kernel keeps the device and queues its I/O
-  (`UBLK_F_USER_RECOVERY`), and `blockgw serve --recover` re-attaches it. On reopen, every region
+- **Crash recovery**: `blockgw serve` is a small supervisor around a worker process.
+  - If the worker dies, the kernel keeps the device and queues its I/O (`UBLK_F_USER_RECOVERY`).
+    The supervisor restarts the worker at once, and the new worker re-attaches the device.
+  - If no worker comes back within `--orphan-timeout` (30 s by default), the supervisor stops the
+    devices, so I/O fails with `EIO` instead of hanging forever. On reopen, every region
   whose intent bit is still set is re-uploaded before the device is served again (holes are skipped
   using `SEEK_DATA`), so the object store converges to the local image.
 - **Fencing**: opening a disk claims epoch `e+1` with a create-only PUT. It then writes tombstones
@@ -116,7 +119,7 @@ Requirements:
 cargo build --release
 sudo modprobe ublk_drv
 cp examples/config.json /etc/blockgw.json   # edit endpoint, bucket, credentials, disks
-sudo MALLOC_ARENA_MAX=2 target/release/blockgw serve /etc/blockgw.json &
+sudo MALLOC_ARENA_MAX=2 target/release/blockgw serve /etc/blockgw.json &   # supervisor + worker
 sudo mkfs.xfs /dev/ublkb0 && sudo mount /dev/ublkb0 /mnt
 
 target/release/blockgw ctl /run/blockgw.sock stats
@@ -124,30 +127,35 @@ target/release/blockgw ctl /run/blockgw.sock policy 0 remote   # fsync now waits
 target/release/blockgw ctl /run/blockgw.sock drain 0           # upload everything sealed so far
 ```
 
-After a crash, run `blockgw serve CONFIG --recover` to re-attach the existing devices. To move a disk,
-unmount it, run `drain`, stop the process, and start a server with the same `prefix` on the new
-host; the image is restored from the object store.
+Running the service:
+
+- **Restarts**: the supervisor restarts a crashed worker by itself. A fresh `blockgw serve` after the
+  whole service died also re-attaches devices that are waiting for a server, and adds any that are
+  missing; no flag is needed.
+- **Shutdown**: `SIGTERM` drains every disk's upload queue, then exits, and leaves the devices
+  recoverable by the next start.
+- **Moving a disk**: unmount it, run `drain`, stop the service, then start a server with the same
+  `prefix` on the new host. The image is restored from the object store.
 
 ## Testing
 
 - `cargo test`: unit tests for the segment format, replay and fencing rules, write-intent tracking
   and in-order commit.
-- `sudo tests/e2e/run.sh`: ten end-to-end cases against real ublk devices and a local SeaweedFS
-  (crash recovery, restore, fencing, policy switch, discard, multi-disk, idle requests, ...).
+- `sudo tests/e2e/run.sh`: fourteen end-to-end cases against real ublk devices and a local
+  SeaweedFS (crash recovery, supervisor restart, orphan timeout, graceful drain, restore, fencing,
+  policy switch, discard, multi-disk, idle requests, ...).
 - `bench/bench.sh`: the benchmark behind the numbers above.
 
 See [docs/testing.md](docs/testing.md).
 
 ## Roadmap
 
-1. A supervisor timeout for orphaned devices. A ublk device whose server died and was never
-   recovered queues I/O forever.
-2. Lazy cold reads: fetch byte ranges of segments on demand, so a host needs only a cache rather
+1. Lazy cold reads: fetch byte ranges of segments on demand, so a host needs only a cache rather
    than the full image.
-3. Checkpoints of the extent map, plus garbage collection and repacking of dead segments.
-4. Encryption at rest (per-disk keys).
-5. Optional streaming of unflushed writes to a standby.
-6. Zero-copy ublk (Linux 6.15+) and a systematic crash-consistency test matrix.
+2. Checkpoints of the extent map, plus garbage collection and repacking of dead segments.
+3. Encryption at rest (per-disk keys).
+4. Optional streaming of unflushed writes to a standby.
+5. Zero-copy ublk (Linux 6.15+) and a systematic crash-consistency test matrix.
 
 ## Contributing
 

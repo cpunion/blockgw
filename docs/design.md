@@ -72,7 +72,7 @@ Under both policies:
   sequence order, so any committed prefix is a state the disk could have crashed into.
 - **A planned move loses nothing**: unmount, `drain`, then hand the disk over.
 - **A process crash on a surviving host loses nothing.** The image and the intent map are on local
-  disk; `--recover` re-attaches the device and re-uploads every region still marked dirty.
+  disk; the restarted worker re-uploads every region still marked dirty, then re-attaches the device.
 
 Switching policies:
 
@@ -178,8 +178,10 @@ device is attached:
 
 | Failure | What the consumer sees | Handling |
 |---|---|---|
-| Server process crashes or is upgraded | I/O stalls (ublk user recovery), no errors | `serve --recover` re-uploads the dirty regions and re-attaches |
-| Server dies and is never recovered | **I/O hangs indefinitely** | Not handled yet: needs a supervisor timeout that deletes the device so I/O fails (roadmap item 1) |
+| Worker process crashes | I/O stalls (ublk user recovery), no errors | The supervisor restarts the worker at once; the worker re-uploads the dirty regions, then re-attaches |
+| No worker comes back within `--orphan-timeout` (default 30 s) | I/O fails with `EIO`; the filesystem shuts down | The supervisor stops the devices, deletes them asynchronously (the kernel finishes once the filesystem is unmounted), and exits with status 1 |
+| The whole service is killed (supervisor and worker) | I/O stalls until the service is started again | A new `serve` re-attaches every device that is waiting for a server |
+| `SIGTERM` | nothing; the devices stay recoverable | The worker drains every disk's upload queue (bounded at 60 s per disk), then exits |
 | Object store unavailable | `local`: none until the lag exceeds `max_lag`, then writers wait. `remote`: `fsync` blocks | Uploads retry with backoff up to 5 s; errors are logged |
 | Fenced by a newer writer | `EIO` on every I/O | `FENCED` log line; the disk must be given up |
 | Local image or intent file lost | disk unusable on this host | Restore on any host from the log; under `local`, the un-uploaded tail is lost |
@@ -187,6 +189,11 @@ device is attached:
 
 ## 4. Process model and resources
 
+- **Processes**: `blockgw serve` is a supervisor with no threads of its own. It runs
+  `blockgw worker CONFIG` and polls the state of the configured ublk devices every 100 ms.
+  - A starting worker attaches each device according to its kernel state: QUIESCED or FAIL_IO →
+    recover; DEAD → delete and add; missing → add; LIVE → refuse, because another server owns it.
+  - `--no-supervisor` runs the worker directly, for an external service manager.
 - **Threads**: one ublk queue thread per disk queue, plus one dispatcher thread per disk; one
   control-socket thread and 16 upload workers per process.
 - **Memory**: 15.5 MB for 16 idle disks.
@@ -212,12 +219,11 @@ device is attached:
 
 ## 6. Not implemented yet
 
-1. A supervisor timeout for orphaned devices (§3.7).
-2. Lazy cold reads: today the full image lives on the host and a restore downloads every segment.
-3. Extent-map checkpoints. Restore time grows with segment count.
-4. Garbage collection and repacking: dead segments are never deleted.
-5. Encryption at rest.
-6. Standby replication of unflushed writes.
+1. Lazy cold reads: today the full image lives on the host and a restore downloads every segment.
+2. Extent-map checkpoints. Restore time grows with segment count.
+3. Garbage collection and repacking: dead segments are never deleted.
+4. Encryption at rest.
+5. Standby replication of unflushed writes.
 
 ## 7. Alternatives considered
 

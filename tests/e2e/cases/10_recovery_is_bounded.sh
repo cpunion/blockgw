@@ -5,7 +5,7 @@ start_server "$cfg"
 id=$(cfg_ids "$cfg")
 mkfs_mount "$id" "$W/m"
 rand_file "$W/m/f" $((32 << 20)); sync -f "$W/m"; drain "$cfg" "$id"; sleep 2
-kill9_server "$cfg"; start_server "$cfg" --recover
+kill9_all "$cfg"; start_server "$cfg"
 n=$(last_start_log "$cfg" | grep -oE '[0-9]+ dirty regions' | grep -oE '^[0-9]+')
 log "metric: dirty regions after an idle crash: $n (disk has $((8 << 30 >> 22)) regions)"
 assert_lt "$n" 4 "dirty regions after an idle crash"

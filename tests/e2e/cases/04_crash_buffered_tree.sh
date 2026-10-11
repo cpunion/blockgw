@@ -9,7 +9,7 @@ h=$(tree_hash "$W/src")
 ( cp -a "$W/src" "$W/m/copy"; sync -f "$W/m"; echo $? > "$W/cp.rc" ) &
 cp_pid=$!
 sleep 0.7
-kill9_server "$cfg"; start_server "$cfg" --recover
+kill9_all "$cfg"; start_server "$cfg"
 wait $cp_pid
 assert_eq "$(cat "$W/cp.rc")" 0 "copy + sync exit status"
 assert_eq "$(tree_hash "$W/m/copy")" "$h" "tree after crash"

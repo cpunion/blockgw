@@ -37,7 +37,7 @@ EOF
 cfg_ids() { python3 -c "import json,sys;print(' '.join(str(d['id']) for d in json.load(open(sys.argv[1]))['devices']))" "$1"; }
 cfg_sock() { python3 -c "import json,sys;print(json.load(open(sys.argv[1]))['control_socket'])" "$1"; }
 
-# start_server CONFIG [--recover]: waits until every disk of CONFIG reports ready (or fails).
+# start_server CONFIG [serve flags]: waits until every disk of CONFIG reports ready (or fails).
 start_server() {
   local cfg=$1; shift
   local logf="${cfg%.json}.log" id t0
@@ -56,7 +56,22 @@ start_server() {
 server_log() { cat "${1%.json}.log"; }
 # last_start_log CONFIG: log lines of the most recent start only
 last_start_log() { sed -n '/^=== start/h; /^=== start/!H; ${x;p}' "${1%.json}.log"; }
-kill9_server() { kill -9 "$(cat "${1%.json}.pid")" 2>/dev/null; sleep 0.2; }
+# The recorded pid is the supervisor (`serve`), or the worker itself with --no-supervisor.
+worker_pid() { local p; p=$(cat "${1%.json}.pid"); pgrep -P "$p" -f "blockgw worker" || echo "$p"; }
+ready_count() { grep -c "ready" "${1%.json}.log"; }
+# kill9_worker CONFIG: crash only the worker; the supervisor restarts it. Waits for every disk to be
+# served again (a new "ready" line per disk).
+kill9_worker() {
+  local cfg=$1 before n t0; before=$(ready_count "$cfg"); n=$(cfg_ids "$cfg" | wc -w)
+  kill -9 "$(worker_pid "$cfg")"; t0=$(now_ms)
+  until [ "$(ready_count "$cfg")" -ge $((before + n)) ]; do
+    [ $(( $(now_ms) - t0 )) -lt 120000 ] || fail "worker not restarted after 120 s"
+    sleep 0.05
+  done
+}
+# kill9_all CONFIG: crash the whole process tree (supervisor and worker), as a host-level failure of
+# the service would; restart it with start_server.
+kill9_all() { local w; w=$(worker_pid "$1"); kill -9 "$(cat "${1%.json}.pid")" "$w" 2>/dev/null; sleep 0.3; }
 ctl() { local cfg=$1; shift; "$BLOCKGW" ctl "$(cfg_sock "$cfg")" "$@"; }
 # stat CONFIG ID FIELD -> value of FIELD=... on the disk line of `ctl stats`
 stat() { ctl "$1" stats | awk -v id="$2" -v f="$3" '$1=="disk" && $2==id { for (i=3;i<=NF;i++) { split($i,a,"="); if (a[1]==f) print a[2] } }'; }
