@@ -17,7 +17,7 @@ use crate::restore;
 use crate::segment::{self, Builder};
 use crate::store::{PutOutcome, Store};
 use crate::track::{CommitTracker, RegionTracker};
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 use std::collections::{BTreeSet, VecDeque};
 use std::fs::{File, OpenOptions};
 use std::os::unix::fs::{FileExt, OpenOptionsExt};
@@ -760,6 +760,12 @@ impl Dev {
             crate::error!("disk {}: FENCED: a newer epoch exists; stopping GC and failing all I/O", self.cfg.id);
             return Ok((0, 0));
         }
+        // checkpoints first: while a checkpoint exists, every segment it references exists, so a
+        // reader holding a checkpoint (or a copy of the store that contains one) is never left with
+        // a hole in the log
+        for k in crate::gc::deletable_checkpoints(&self.store.list(&format!("{p}/ckpt/"))?, older.pos) {
+            self.store.delete(&k)?;
+        }
         let listing = self.store.list_sized(&format!("{p}/seg/"))?;
         let doomed = crate::gc::deletable_segments(&listing, &older, &newer);
         let sizes: std::collections::HashMap<&str, u64> = listing.iter().map(|(k, s)| (k.as_str(), *s)).collect();
@@ -767,9 +773,6 @@ impl Dev {
             self.store.delete(k)?;
             self.stats.gc_deleted_segments.fetch_add(1, Relaxed);
             self.stats.gc_deleted_bytes.fetch_add(sizes.get(k.as_str()).copied().unwrap_or(0), Relaxed);
-        }
-        for k in crate::gc::deletable_checkpoints(&self.store.list(&format!("{p}/ckpt/"))?, older.pos) {
-            self.store.delete(&k)?;
         }
         let repacked = self.repack(newer.pos)?;
         if !doomed.is_empty() || repacked > 0 {
@@ -898,15 +901,60 @@ fn claim_epoch(s3: &dyn Store, p: &str) -> Result<u64> {
             continue; // another writer claimed it first; look again
         }
         if last > 0 {
-            let segs: BTreeSet<u64> =
-                s3.list(&format!("{p}/seg/{last:010}/"))?.iter().filter_map(|k| log::parse_seg_key(k)).map(|(_, s)| s).collect();
-            for sq in log::fence_targets(&segs, FENCE_SPAN) {
-                // Exists = the old writer landed this one meanwhile; replay stops at the first tombstone anyway
-                s3.put_new(&log::key_seg(p, last, sq), log::TOMB)?;
-            }
+            seal_epochs(s3, p, last)?;
         }
         return Ok(last + 1);
     }
+}
+
+/// Fence every unsealed epoch up to `last`, oldest first, so that afterwards every epoch below the
+/// new one is sealed (its highest object is a tombstone). Sealing only the previous epoch is not
+/// enough: a claim that crashed between writing its epoch marker and fencing would leave the epoch
+/// before it unfenced, and that writer could keep landing segments that a later restore replays.
+/// Oldest first, so a claim that crashes midway leaves a sealed prefix for the next claim to extend.
+fn seal_epochs(s3: &dyn Store, p: &str, last: u64) -> Result<()> {
+    let mut objs: std::collections::BTreeMap<u64, std::collections::BTreeMap<u64, bool>> = Default::default();
+    for (k, size) in s3.list_sized(&format!("{p}/seg/"))? {
+        if let Some((e, s)) = log::parse_seg_key(&k) {
+            objs.entry(e).or_default().insert(s, size as usize == log::TOMB.len());
+        }
+    }
+    let mut ckpt_seq: std::collections::HashMap<u64, u64> = Default::default();
+    for k in s3.list(&format!("{p}/ckpt/"))? {
+        if let Some((e, s)) = log::parse_ckpt_key(&k) {
+            let c = ckpt_seq.entry(e).or_insert(s);
+            *c = (*c).max(s);
+        }
+    }
+    let first = (1..=last).rev().find(|e| objs.get(e).is_some_and(log::is_sealed)).map_or(1, |e| e + 1);
+    for e in first..=last {
+        let existing: BTreeSet<u64> = objs.get(&e).map(|m| m.keys().copied().collect()).unwrap_or_default();
+        let from = ckpt_seq.get(&e).map_or(0, |s| s + 1);
+        // A gap is either an upload still in flight (fill it with a tombstone) or a lost segment.
+        // Segments above the first gap attest how far the log was committed when they were
+        // encoded; if one says the gap was already committed, the segment was lost: refuse,
+        // rather than seal the hole and restore a partial log.
+        let gap = (from..).find(|i| !existing.contains(i)).unwrap();
+        for (&s, &tomb) in objs.get(&e).into_iter().flatten().filter(|(s, _)| **s > gap) {
+            if tomb {
+                continue;
+            }
+            let k = log::key_seg(p, e, s);
+            let c = segment::committed(&s3.get_range(&k, 0, segment::HEADER as u64)?).with_context(|| k.clone())?;
+            if c > gap {
+                bail!(
+                    "log incomplete: segment {} is missing, but {k} attests that the log was committed up to seq {}",
+                    log::key_seg(p, e, gap),
+                    c - 1
+                );
+            }
+        }
+        for sq in log::fence_targets(&existing, FENCE_SPAN, from) {
+            // Exists = the old writer landed this one meanwhile; replay stops at the first tombstone anyway
+            s3.put_new(&log::key_seg(p, e, sq), log::TOMB)?;
+        }
+    }
+    Ok(())
 }
 
 /// Bits set in `full` and not in `sub` (both little-endian u64 bitmaps of equal length).
@@ -989,7 +1037,8 @@ impl Pool {
             if let Err(e) = crate::failpoint::hit("upload") {
                 crate::warn!("disk {}: {e}", dev.cfg.id);
             }
-            let obj = segment::encode(dev.epoch, seq, &seg);
+            // attest the committed prefix as of now: every seq below it is durable in the store
+            let obj = segment::encode(dev.epoch, seq, dev.committed.load(SeqCst), &seg);
             let key = log::key_seg(&dev.cfg.prefix, dev.epoch, seq);
             let mut backoff = 100;
             let t0 = Instant::now();

@@ -129,10 +129,10 @@ Object layout:
 <prefix>/ckpt/<e:010>/<s:012>   checkpoint: the committed extent map after segment s of epoch e
 ```
 
-Segment format v2. The layout lets a reader fetch only the frames it needs with ranged GETs:
+Segment format v3. The layout lets a reader fetch only the frames it needs with ranged GETs:
 
 ```
-header (40 B): "BGS2" | epoch u64 | seq u64 | n_entries u32 | n_frames u32 | frame_size u32 | meta_len u32 | crc32(meta) u32
+header (48 B): "BGS3" | epoch u64 | seq u64 | committed u64 | n_entries u32 | n_frames u32 | frame_size u32 | meta_len u32 | crc32(meta) u32
 meta:          n_entries × (kind u8, disk_off u64, len u32, data_off u64)          kind 0 = data, 1 = discard
                n_frames  × (obj_off u64, obj_len u32, raw_len u32, codec u8, crc32(raw) u32)
 frames:        the data stream cut into 256 KiB frames, each raw or zstd, independently decodable
@@ -143,6 +143,10 @@ frames:        the data stream cut into 256 KiB frames, each raw or zstd, indepe
 - `data_off` is the entry's position in the data stream; frame `i` covers bytes
   `[i × frame_size, i × frame_size + raw_len)` of it.
 - Every frame carries a crc32 of its raw bytes, and the meta carries one too.
+- `committed` attests how far the writer's log was committed when the segment was encoded: every
+  seq of the epoch below it exists in the store. Sealing uses it to tell a lost segment from one
+  that was still in flight (§3.4).
+- v2 (`BGS2`, 40-byte header, no `committed`) is still read, as `committed = 0`.
 
 ### 3.3a Extent map and checkpoints
 
@@ -176,13 +180,29 @@ Opening a disk:
 
 1. List `<prefix>/epoch/` and take the highest epoch `L`.
 2. Create `<prefix>/epoch/<L+1>` with `If-None-Match: *`. If it already exists, go back to step 1.
-3. List `<prefix>/seg/<L>/` and write a tombstone, create-only, into every free sequence number
-   from the first gap up to `max + FENCE_SPAN`, where `FENCE_SPAN = 2 × WINDOW`.
+3. **Seal** every epoch up to `L` that is not sealed yet, oldest first. An epoch is sealed when its
+   highest object is a tombstone. To seal epoch `E`, write a tombstone, create-only, into every
+   free sequence number from the first gap up to `max + FENCE_SPAN`, where `FENCE_SPAN = 2 × WINDOW`.
+   The first gap is searched from one past `E`'s newest checkpoint: holes below it were made by
+   GC, not by uploads in flight, and need no tombstones.
    - The old writer has at most `WINDOW` uploads in flight beyond its committed prefix, so all of
      them collide.
    - If a tombstone PUT finds its key already taken, the old writer just landed that segment. That
      is still safe: replay stops at the first tombstone either way.
+   - **Lost or in flight?** A gap is normally an upload that was in flight when the writer died, and
+     gets a tombstone. But if any segment above the gap attests `committed` beyond it, the gap's
+     segment had already been committed and was lost from the store: opening fails with "log
+     incomplete" rather than sealing the hole and restoring a partial log. Segments above the first
+     gap are at most the writer's upload window, so this costs a few ranged GETs, and none in the
+     common case (no gap).
+   - Sealing every unsealed epoch, not only `L`, matters when a claim crashed between writing its
+     epoch marker and fencing: epoch `L` is then empty, and the writer of `L−1` would otherwise
+     stay unfenced and could keep landing segments that a later restore replays. Oldest first, so
+     a claim that crashes midway leaves a sealed prefix for the next one to extend.
 4. Replay the segments that are needed (§3.5), then serve the disk under epoch `L+1`.
+
+After step 3 every epoch below the new one is sealed, which lets restore detect missing objects
+(§3.5).
 
 When an upload of the old writer finds its key taken (HTTP 412 or 409), the old writer marks the
 disk fenced. All further I/O on it fails with `EIO`, and it logs `FENCED`.
@@ -213,6 +233,14 @@ or tombstone. Then:
   the checkpoint plus the metas of later segments (one small ranged GET each).
 - **Divergence**: if the host has un-uploaded writes (intent bits set) and another host has written
   since, opening fails with a "diverged" error and nothing is overwritten.
+- **Missing objects**: every epoch below the new one is sealed (§3.4), so each epoch's run must end
+  at a tombstone. A run that breaks off at a gap means a segment is missing from the store (lost,
+  deleted by hand, or a store copy taken carelessly). Opening fails with "log incomplete" instead
+  of restoring a partial log; the same holds for a checkpoint whose epoch has no objects at all.
+  In the newest epoch, sealing catches the loss through `committed` (§3.4). A loss of the very
+  last segments of an epoch, with nothing written after them, cannot be told from uploads in
+  flight; under `remote` such segments were never acknowledged unless they were committed, and a
+  committed segment is followed by later ones only if the writer kept writing.
 
 With `lazy` (the default), a rebuild does not download any data up front: see 3.5b.
 
@@ -237,13 +265,16 @@ checkpoint the disk was opened from counts as the first.
 
 1. **Ownership**: if an epoch marker newer than the server's own exists, the server marks itself
    fenced and stops. Only the current owner deletes.
-2. **Delete segments**: a data segment may be deleted when it is at or below the position of the
+2. **Delete old checkpoints**: those older than the older of the two. This comes first: while a
+   checkpoint exists, every segment it references exists. A reader that found a checkpoint, or a
+   copy of the store that contains one, therefore never meets a hole in the log it needs (the
+   torture tests copy live stores this way).
+3. **Delete segments**: a data segment may be deleted when it is at or below the position of the
    *older* checkpoint and *neither* checkpoint references it.
    - Keeping two checkpoints' worth covers a reader that listed the older checkpoint just before
      the newer one was written.
    - **Tombstones (4-byte objects) are never deleted**: a fenced writer that is still running must
-     keep colliding with them.
-3. **Delete old checkpoints**: those older than the older of the two.
+     keep colliding with them, and they mark sealed epochs (§3.4).
 4. **Repack**: segments at or below the newer checkpoint whose live fraction is below
    `repack_ratio` (default 0.5) have their live blocks copied from the local image into the open
    segment, oldest first, within `repack_budget_mb` per round (default 64).
@@ -350,6 +381,7 @@ The torture test runs in CI with `--encrypt` as well (remote policy), and e2e ca
 | Object store unavailable | `local`: none until the lag exceeds `max_lag`, then writers wait. `remote`: `fsync` blocks | Uploads retry with backoff up to 5 s; errors are logged |
 | Fenced by a newer writer | `EIO` on every I/O | `FENCED` log line; the disk must be given up |
 | Wrong, missing or unexpected key | the disk is not attached | opening fails with a decryption or "no key_file" error; nothing is served |
+| A segment or checkpoint missing from the store | the disk is not attached | opening fails with "log incomplete"; a partial log is never restored |
 | Local image or intent file lost | disk unusable on this host | Restore on any host from the log; under `local`, the un-uploaded tail is lost |
 | Host lost | — | Another host opens the disk; under `local`, up to `max_lag` of tail is lost |
 

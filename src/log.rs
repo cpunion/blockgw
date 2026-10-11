@@ -63,14 +63,22 @@ pub fn contiguous_from(seqs: &[u64], start: u64) -> usize {
     seqs.iter().enumerate().take_while(|(i, s)| **s == start + *i as u64).count()
 }
 
-/// Keys a new writer must occupy (with tombstones) in the previous epoch so that every PUT the old
-/// writer may still have in flight collides: every free seq from the first gap up to max + span.
-/// An old writer keeps at most `window` PUTs in flight beyond its contiguous prefix, so
-/// `span >= window` covers them.
-pub fn fence_targets(existing: &BTreeSet<u64>, span: u64) -> Vec<u64> {
-    let first_gap = (0..).find(|i| !existing.contains(i)).unwrap();
-    let max = existing.iter().next_back().copied().unwrap_or(0);
+/// Keys a new writer must occupy (with tombstones) in an older epoch so that every PUT its writer
+/// may still have in flight collides: every free seq from the first gap at or after `from` up to
+/// max + span. An old writer keeps at most `window` PUTs in flight beyond its contiguous prefix, so
+/// `span >= window` covers them. `from` is one past the epoch's newest checkpoint: holes below it
+/// were made by GC, not by uploads in flight, and need no tombstones.
+pub fn fence_targets(existing: &BTreeSet<u64>, span: u64, from: u64) -> Vec<u64> {
+    let first_gap = (from..).find(|i| !existing.contains(i)).unwrap();
+    let max = existing.iter().next_back().copied().unwrap_or(0).max(from);
     (first_gap..=max + span).filter(|s| !existing.contains(s)).collect()
+}
+
+/// An epoch is sealed once its highest object is a tombstone: a later writer fenced it, and the
+/// old writer can no longer land anything (its window collides with the tombstones).
+/// `objs`: seq -> is tombstone.
+pub fn is_sealed(objs: &std::collections::BTreeMap<u64, bool>) -> bool {
+    objs.values().next_back() == Some(&true)
 }
 
 #[cfg(test)]
@@ -104,10 +112,24 @@ mod tests {
     fn fence_covers_gaps_and_in_flight_window() {
         let set = |v: &[u64]| v.iter().copied().collect::<BTreeSet<u64>>();
         // nothing written yet: occupy 0..=span
-        assert_eq!(fence_targets(&set(&[]), 3), vec![0, 1, 2, 3]);
+        assert_eq!(fence_targets(&set(&[]), 3, 0), vec![0, 1, 2, 3]);
         // contiguous 0..=4: occupy 5..=4+span
-        assert_eq!(fence_targets(&set(&[0, 1, 2, 3, 4]), 2), vec![5, 6]);
+        assert_eq!(fence_targets(&set(&[0, 1, 2, 3, 4]), 2, 0), vec![5, 6]);
         // out-of-order uploads left gaps at 2 and 4: fill them and the window past the max
-        assert_eq!(fence_targets(&set(&[0, 1, 3, 5]), 2), vec![2, 4, 6, 7]);
+        assert_eq!(fence_targets(&set(&[0, 1, 3, 5]), 2, 0), vec![2, 4, 6, 7]);
+        // GC deleted 0..=6 below a checkpoint at 7: no tombstones in those holes
+        assert_eq!(fence_targets(&set(&[7, 8, 9]), 2, 8), vec![10, 11]);
+        // everything at or below the checkpoint was collected
+        assert_eq!(fence_targets(&set(&[]), 2, 8), vec![8, 9, 10]);
+        assert_eq!(fence_targets(&set(&[3]), 2, 8), vec![8, 9, 10]);
+    }
+
+    #[test]
+    fn sealed_means_the_highest_object_is_a_tombstone() {
+        let m = |v: &[(u64, bool)]| v.iter().copied().collect::<std::collections::BTreeMap<u64, bool>>();
+        assert!(!is_sealed(&m(&[])));
+        assert!(!is_sealed(&m(&[(0, false), (1, false)])));
+        assert!(is_sealed(&m(&[(0, false), (1, true), (2, true)])));
+        assert!(!is_sealed(&m(&[(0, true), (5, false)])), "a segment above every tombstone: not sealed");
     }
 }

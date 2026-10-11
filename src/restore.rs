@@ -5,14 +5,16 @@
 //! * `restore_full`: the image is rebuilt, by fetching the checkpoint's live runs with ranged GETs
 //!   and then replaying every later segment in full.
 //!
-//! Within an epoch only the contiguous prefix `0, 1, 2, ...` is valid, ending at the first gap or
-//! tombstone; epochs are replayed in ascending order.
+//! Within an epoch only the contiguous prefix `0, 1, 2, ...` is valid, ending at the first
+//! tombstone; epochs are replayed in ascending order. Opening a disk seals every older epoch first
+//! (`claim_epoch`), so each epoch's run must end at a tombstone: a run that ends at a gap means an
+//! object is missing from the store, and the plan fails rather than restore a partial log.
 
 use crate::extmap::{fetch_plan, ExtentMap, BLOCK};
 use crate::log;
 use crate::segment::{self, KIND_DATA};
 use crate::store::Store;
-use anyhow::{ensure, Context, Result};
+use anyhow::{bail, ensure, Context, Result};
 use std::collections::BTreeMap;
 use std::fs::File;
 use std::os::unix::fs::FileExt;
@@ -24,7 +26,7 @@ type SegRuns = Vec<(u32, u32, u64)>;
 pub struct Plan {
     /// newest checkpoint: key and the log position it reflects
     pub ckpt: Option<(String, (u64, u64))>,
-    /// segments after the checkpoint, per epoch in ascending order: (seq, key), contiguous prefix only
+    /// segments after the checkpoint, per epoch in ascending order: (seq, key), up to the tombstone
     pub after: Vec<(u64, Vec<(u64, String)>)>,
 }
 
@@ -42,13 +44,16 @@ pub fn plan(store: &dyn Store, prefix: &str, below_epoch: u64) -> Result<Plan> {
         .filter_map(|k| log::parse_ckpt_key(&k).map(|pos| (k, pos)))
         .filter(|(_, (e, _))| *e < below_epoch)
         .max_by_key(|(_, pos)| *pos);
-    let mut by_epoch: BTreeMap<u64, Vec<(u64, String)>> = BTreeMap::new();
-    for k in store.list(&format!("{prefix}/seg/"))? {
+    let mut by_epoch: BTreeMap<u64, Vec<(u64, String, bool)>> = BTreeMap::new();
+    for (k, size) in store.list_sized(&format!("{prefix}/seg/"))? {
         if let Some((e, s)) = log::parse_seg_key(&k) {
             if e < below_epoch {
-                by_epoch.entry(e).or_default().push((s, k));
+                by_epoch.entry(e).or_default().push((s, k, size as usize == log::TOMB.len()));
             }
         }
+    }
+    if let Some((k, (ce, _))) = &ckpt {
+        ensure!(by_epoch.contains_key(ce), "log incomplete: {k} exists but its epoch {ce} has no segments or tombstones");
     }
     let mut after = Vec::new();
     for (e, mut keys) in by_epoch {
@@ -59,11 +64,20 @@ pub fn plan(store: &dyn Store, prefix: &str, below_epoch: u64) -> Result<Plan> {
             Some((_, (ce, cs))) if e == *ce => cs + 1,
             _ => 0,
         };
-        keys.retain(|(s, _)| *s >= start);
-        let seqs: Vec<u64> = keys.iter().map(|(s, _)| *s).collect();
+        keys.retain(|(s, _, _)| *s >= start);
+        let seqs: Vec<u64> = keys.iter().map(|(s, _, _)| *s).collect();
         keys.truncate(log::contiguous_from(&seqs, start));
+        match keys.iter().position(|(_, _, tomb)| *tomb) {
+            Some(t) => keys.truncate(t),
+            None => bail!(
+                "log incomplete: epoch {e} breaks off after {} segment(s) from {start} without a tombstone \
+                 (a segment is missing from the store{})",
+                keys.len(),
+                if ckpt.is_none() { ", and no checkpoint covers it" } else { "" }
+            ),
+        }
         if !keys.is_empty() {
-            after.push((e, keys));
+            after.push((e, keys.into_iter().map(|(s, k, _)| (s, k)).collect()));
         }
     }
     Ok(Plan { ckpt, after })
@@ -359,7 +373,12 @@ mod tests {
     }
 
     fn put_seg(st: &LocalDir, e: u64, s: u64, b: &Builder) {
-        st.put_new(&log::key_seg("d", e, s), &segment::encode(e, s, b)).unwrap();
+        st.put_new(&log::key_seg("d", e, s), &segment::encode(e, s, 0, b)).unwrap();
+    }
+
+    /// what a later claim does to an epoch: a tombstone ends it
+    fn tomb(st: &LocalDir, e: u64, s: u64) {
+        st.put_new(&log::key_seg("d", e, s), log::TOMB).unwrap();
     }
 
     fn block(v: u8) -> Vec<u8> {
@@ -395,10 +414,11 @@ mod tests {
         st.put_new(&log::key_seg("d", 1, 3), log::TOMB).unwrap(); // a later writer fenced epoch 1 here
         st.put_new(&log::key_seg("d", 1, 4), b"junk past the tombstone").unwrap();
         writes(&st, &mut truth, 2, 0, &[(0, 4), (30, 4)], None);
+        tomb(&st, 2, 1); // the claim of epoch 3 sealed epoch 2
 
         let plan = plan(&st, "d", 3).unwrap();
         assert_eq!(plan.ckpt.as_ref().unwrap().1, (1, 1));
-        assert_eq!(plan.segments(), 4, "epoch 1 seqs 2..=4 (contiguous keys) and epoch 2 seq 0");
+        assert_eq!(plan.segments(), 2, "epoch 1 seq 2 (up to its tombstone) and epoch 2 seq 0");
 
         let img = std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(true).open(r.join("img")).unwrap();
         img.set_len(size).unwrap();
@@ -422,18 +442,54 @@ mod tests {
     }
 
     #[test]
-    fn plan_without_checkpoint_takes_every_contiguous_prefix() {
+    fn plan_without_checkpoint_takes_every_sealed_prefix() {
         let r = root("nockpt");
         let st = LocalDir::new(&r).unwrap();
         let b = Builder::default();
         for (e, s) in [(1, 0), (1, 1), (1, 3), (2, 0), (5, 0)] {
             put_seg(&st, e, s, &b);
         }
+        // the fencing claims: epoch 1's writer had 1/3 in flight when 1/2 was fenced
+        tomb(&st, 1, 2);
+        tomb(&st, 2, 1);
+        tomb(&st, 3, 0); // a writer that never uploaded
         let p = plan(&st, "d", 5).unwrap();
         assert!(p.ckpt.is_none());
         let shape: Vec<(u64, Vec<u64>)> = p.after.iter().map(|(e, v)| (*e, v.iter().map(|(s, _)| *s).collect())).collect();
-        assert_eq!(shape, vec![(1, vec![0, 1]), (2, vec![0])], "gap at 1/2 ends epoch 1; epoch 5 is excluded");
+        assert_eq!(shape, vec![(1, vec![0, 1]), (2, vec![0])], "tombstone at 1/2 ends epoch 1; epoch 5 is excluded");
         std::fs::remove_dir_all(r).unwrap();
+    }
+
+    #[test]
+    fn a_missing_segment_fails_the_plan_instead_of_restoring_a_partial_log() {
+        let r = root("missing");
+        let st = LocalDir::new(&r).unwrap();
+        let b = Builder::default();
+        // epoch 1: 0..=3 then a tombstone, but 2 was lost
+        for s in [0, 1, 3] {
+            put_seg(&st, 1, s, &b);
+        }
+        tomb(&st, 1, 4);
+        put_seg(&st, 2, 0, &b);
+        tomb(&st, 2, 1);
+        let e = plan(&st, "d", 3).err().expect("a hole in the log must fail the plan").to_string();
+        assert!(e.contains("log incomplete") && e.contains("epoch 1"), "{e}");
+        // the start of epoch 1 lost (as a copy taken across a GC round without its checkpoint)
+        let r2 = root("missing-start");
+        let st2 = LocalDir::new(&r2).unwrap();
+        for s in [5, 6] {
+            put_seg(&st2, 1, s, &b);
+        }
+        tomb(&st2, 1, 7);
+        put_seg(&st2, 2, 0, &b);
+        tomb(&st2, 2, 1);
+        let e = plan(&st2, "d", 3).err().expect("no checkpoint covers 1/0..=4").to_string();
+        assert!(e.contains("no checkpoint covers it"), "{e}");
+        // a checkpoint whose epoch vanished entirely
+        st2.put_new(&log::key_ckpt("d", 4, 3), b"x").unwrap();
+        assert!(plan(&st2, "d", 9).is_err());
+        std::fs::remove_dir_all(r).unwrap();
+        std::fs::remove_dir_all(r2).unwrap();
     }
 
     #[test]
@@ -442,8 +498,10 @@ mod tests {
         let st = LocalDir::new(&r).unwrap();
         let b = Builder::default();
         for s in [3, 5, 6, 7, 9] {
-            put_seg(&st, 1, s, &b); // 0..=2 and 4 were collected; 8 is a real gap
+            put_seg(&st, 1, s, &b); // 0..=2 and 4 were collected; 8 was in flight when fenced
         }
+        tomb(&st, 1, 8);
+        tomb(&st, 1, 10);
         st.put_new(&log::key_ckpt("d", 1, 4), b"x").unwrap();
         let p = plan(&st, "d", 2).unwrap();
         let seqs: Vec<u64> = p.after[0].1.iter().map(|(s, _)| *s).collect();
