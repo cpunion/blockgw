@@ -21,7 +21,13 @@ pub trait Store: Send + Sync {
     /// Bytes `[off, off + len)` of `key` (fewer if the object is shorter).
     fn get_range(&self, key: &str, off: u64, len: u64) -> Result<Vec<u8>>;
     /// All keys starting with `prefix`, sorted.
-    fn list(&self, prefix: &str) -> Result<Vec<String>>;
+    fn list(&self, prefix: &str) -> Result<Vec<String>> {
+        Ok(self.list_sized(prefix)?.into_iter().map(|(k, _)| k).collect())
+    }
+    /// All keys starting with `prefix` with their sizes, sorted by key.
+    fn list_sized(&self, prefix: &str) -> Result<Vec<(String, u64)>>;
+    /// Delete `key`; deleting a missing key is not an error.
+    fn delete(&self, key: &str) -> Result<()>;
 }
 
 /// Objects as files under a root directory (key `a/b/c` is file `<root>/a/b/c`). Useful for local
@@ -92,7 +98,14 @@ impl Store for LocalDir {
         Ok(buf)
     }
 
-    fn list(&self, prefix: &str) -> Result<Vec<String>> {
+    fn delete(&self, key: &str) -> Result<()> {
+        match fs::remove_file(self.path(key)?) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e.into()),
+            _ => Ok(()),
+        }
+    }
+
+    fn list_sized(&self, prefix: &str) -> Result<Vec<(String, u64)>> {
         // walk from the deepest directory the prefix names, then filter by the full prefix
         let base = match prefix.rfind('/') {
             Some(i) => &prefix[..i],
@@ -119,7 +132,12 @@ impl Store for LocalDir {
                 } else if let Ok(rel) = path.strip_prefix(&self.root) {
                     let key = rel.to_string_lossy().into_owned();
                     if key.starts_with(prefix) {
-                        out.push(key);
+                        let size = match entry.metadata() {
+                            Ok(m) => m.len(),
+                            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue, // deleted meanwhile
+                            Err(e) => return Err(e.into()),
+                        };
+                        out.push((key, size));
                     }
                 }
             }
@@ -166,6 +184,10 @@ mod tests {
         assert_eq!(s.list("p/epoch/").unwrap(), vec!["p/epoch/0001"]);
         assert!(s.list("missing/").unwrap().is_empty());
         assert_eq!(s.list("p/seg/0001/000").unwrap().len(), 2, "partial last component");
+        assert_eq!(s.list_sized("p/epoch/").unwrap(), vec![("p/epoch/0001".to_string(), 1)]);
+        s.delete("p/seg/0001/0000").unwrap();
+        s.delete("p/seg/0001/0000").unwrap(); // missing is fine
+        assert_eq!(s.list("p/seg/0001/").unwrap(), vec!["p/seg/0001/0001"]);
         fs::remove_dir_all(root).unwrap();
     }
 

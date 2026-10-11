@@ -50,6 +50,30 @@ pub struct DevConfig {
     pub depth: u16,
     #[serde(default = "default_queues")]
     pub queues: u16,
+    /// checkpoint after this many committed segments (or CKPT_INTERVAL_SECS)
+    #[serde(default = "default_ckpt_every")]
+    pub checkpoint_every: u64,
+    /// garbage-collect dead segments and repack sparse ones after each checkpoint
+    #[serde(default = "default_true")]
+    pub gc: bool,
+    /// repack segments whose live fraction is below this
+    #[serde(default = "default_repack_ratio")]
+    pub repack_ratio: f64,
+    /// live data rewritten per GC round
+    #[serde(default = "default_repack_budget")]
+    pub repack_budget_mb: u64,
+}
+fn default_ckpt_every() -> u64 {
+    CKPT_EVERY
+}
+fn default_true() -> bool {
+    true
+}
+fn default_repack_ratio() -> f64 {
+    0.5
+}
+fn default_repack_budget() -> u64 {
+    64
 }
 fn default_policy() -> String {
     "local".into()
@@ -100,6 +124,9 @@ pub struct Stats {
     pub upload_errors: AtomicU64,
     pub upload_micros: AtomicU64,
     pub flush_wait_micros: AtomicU64,
+    pub gc_deleted_segments: AtomicU64,
+    pub gc_deleted_bytes: AtomicU64,
+    pub gc_repacked_bytes: AtomicU64,
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Default)]
@@ -121,6 +148,8 @@ pub struct Dev {
     store: Arc<dyn Store>,
     last_ckpt: AtomicU64, // `committed` value covered by the last checkpoint
     last_ckpt_at: Mutex<Instant>,
+    /// the last two checkpoints written by this server (GC deletes against both)
+    ckpts: Mutex<VecDeque<crate::gc::Checkpoint>>,
     queue_cv: Condvar,
     pub epoch: u64,
     next_seq: AtomicU64,
@@ -159,6 +188,7 @@ impl Dev {
         let mut cmap = ExtentMap::create(&dir.join("cmap"), size)?;
         let t0 = Instant::now();
         let foreign = st.epoch == 0 || restore::has_foreign_data(s3, &plan, st.epoch)?;
+        let loaded_ckpt;
         if fresh || foreign {
             if !fresh && !dirty.is_empty() && foreign && st.epoch != 0 {
                 bail!("disk {} diverged: local writes were never uploaded and another host has written since", cfg.id);
@@ -167,7 +197,8 @@ impl Dev {
             image.set_len(0)?;
             image.set_len(size)?;
             let replay = OpenOptions::new().write(true).open(dir.join("data"))?;
-            let r = restore::restore_full(s3, &p, &plan, &mut cmap, &replay)?;
+            let mut r = restore::restore_full(s3, &p, &plan, &mut cmap, &replay)?;
+            loaded_ckpt = r.ckpt.take();
             replay.sync_all()?;
             crate::info!(
                 "disk {}: restored from the object store in {} ms ({} MiB of live data from {}, then {} segments)",
@@ -178,7 +209,8 @@ impl Dev {
                 r.segments
             );
         } else {
-            let n = restore::rebuild_map(s3, &p, &plan, &mut cmap)?;
+            let (n, ck) = restore::rebuild_map(s3, &plan, &mut cmap)?;
+            loaded_ckpt = ck;
             crate::info!("disk {}: extent map rebuilt in {} ms (checkpoint + {n} segment metas)", cfg.id, t0.elapsed().as_millis());
         }
         let tmp = dir.join("state.json.tmp");
@@ -202,6 +234,8 @@ impl Dev {
             store,
             last_ckpt: AtomicU64::new(0),
             last_ckpt_at: Mutex::new(Instant::now()),
+            // the checkpoint this disk was opened from counts as the previous one for GC
+            ckpts: Mutex::new(loaded_ckpt.into_iter().collect()),
             queue_cv: Condvar::new(),
             epoch,
             next_seq: AtomicU64::new(0),
@@ -232,6 +266,9 @@ impl Dev {
             flush_wait_seconds: s.flush_wait_micros.load(Relaxed) as f64 / 1e6,
             intent_syncs: s.intent_syncs.load(Relaxed),
             lag_waits: s.lag_waits.load(Relaxed),
+            gc_deleted_segments: s.gc_deleted_segments.load(Relaxed),
+            gc_deleted_bytes: s.gc_deleted_bytes.load(Relaxed),
+            gc_repacked_bytes: s.gc_repacked_bytes.load(Relaxed),
         }
     }
 
@@ -417,16 +454,22 @@ impl Dev {
     /// Upload a checkpoint of the committed extent map if anything committed since the last one.
     /// Returns whether one was written.
     pub fn checkpoint(&self) -> Result<bool> {
-        let (bytes, c) = {
+        let (bytes, c, referenced) = {
             let map = self.cmap.lock().unwrap();
             let c = self.committed.load(SeqCst);
             if c == 0 || c == self.last_ckpt.load(SeqCst) || self.fenced.load(SeqCst) {
                 return Ok(false);
             }
-            (map.encode_checkpoint(self.epoch, c - 1), c)
+            (map.encode_checkpoint(self.epoch, c - 1), c, map.referenced())
         };
         let key = log::key_ckpt(&self.cfg.prefix, self.epoch, c - 1);
         self.store.put_new(&key, &bytes)?; // Exists: an earlier attempt landed; same content
+        let mut ck = self.ckpts.lock().unwrap();
+        ck.push_back(crate::gc::Checkpoint { pos: (self.epoch, c - 1), referenced });
+        while ck.len() > 2 {
+            ck.pop_front();
+        }
+        drop(ck);
         self.last_ckpt.store(c, SeqCst);
         *self.last_ckpt_at.lock().unwrap() = Instant::now();
         crate::debug!("disk {}: checkpoint {key} ({} bytes)", self.cfg.id, bytes.len());
@@ -436,18 +479,100 @@ impl Dev {
     /// Checkpoint every CKPT_EVERY committed segments, or every CKPT_INTERVAL_SECS if anything committed.
     pub fn checkpointer(&self) {
         loop {
-            std::thread::sleep(std::time::Duration::from_secs(2));
+            std::thread::sleep(std::time::Duration::from_millis(250));
             if self.fenced.load(SeqCst) {
                 return;
             }
             let (c, last) = (self.committed.load(SeqCst), self.last_ckpt.load(SeqCst));
-            let due = c >= last + CKPT_EVERY || (c > last && self.last_ckpt_at.lock().unwrap().elapsed().as_secs() >= CKPT_INTERVAL_SECS);
+            let due = c >= last + self.cfg.checkpoint_every.max(1)
+                || (c > last && self.last_ckpt_at.lock().unwrap().elapsed().as_secs() >= CKPT_INTERVAL_SECS);
             if due {
-                if let Err(e) = self.checkpoint() {
-                    crate::warn!("disk {}: checkpoint failed (will retry): {e:#}", self.cfg.id);
+                match self.checkpoint() {
+                    Ok(true) if self.cfg.gc => {
+                        if let Err(e) = self.gc_round() {
+                            crate::warn!("disk {}: gc failed (will retry): {e:#}", self.cfg.id);
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(e) => crate::warn!("disk {}: checkpoint failed (will retry): {e:#}", self.cfg.id),
                 }
             }
         }
+    }
+
+    /// One GC round against the last two checkpoints: delete segments neither references (at or below
+    /// the older one), delete checkpoints older than it, and repack sparse segments.
+    /// Returns (segments deleted, bytes repacked).
+    pub fn gc_round(&self) -> Result<(usize, u64)> {
+        let (older, newer) = {
+            let ck = self.ckpts.lock().unwrap();
+            if ck.len() < 2 || self.fenced.load(SeqCst) {
+                return Ok((0, 0));
+            }
+            (
+                crate::gc::Checkpoint { pos: ck[0].pos, referenced: ck[0].referenced.clone() },
+                crate::gc::Checkpoint { pos: ck[1].pos, referenced: ck[1].referenced.clone() },
+            )
+        };
+        let p = &self.cfg.prefix;
+        // a newer epoch means another server owns the disk: it alone may delete from now on
+        if self.store.list(&format!("{p}/epoch/"))?.iter().filter_map(|k| log::parse_epoch_key(k)).any(|e| e > self.epoch) {
+            self.fenced.store(true, SeqCst);
+            crate::error!("disk {}: FENCED: a newer epoch exists; stopping GC and failing all I/O", self.cfg.id);
+            return Ok((0, 0));
+        }
+        let listing = self.store.list_sized(&format!("{p}/seg/"))?;
+        let doomed = crate::gc::deletable_segments(&listing, &older, &newer);
+        let sizes: std::collections::HashMap<&str, u64> = listing.iter().map(|(k, s)| (k.as_str(), *s)).collect();
+        for k in &doomed {
+            self.store.delete(k)?;
+            self.stats.gc_deleted_segments.fetch_add(1, Relaxed);
+            self.stats.gc_deleted_bytes.fetch_add(sizes.get(k.as_str()).copied().unwrap_or(0), Relaxed);
+        }
+        for k in crate::gc::deletable_checkpoints(&self.store.list(&format!("{p}/ckpt/"))?, older.pos) {
+            self.store.delete(&k)?;
+        }
+        let repacked = self.repack(newer.pos)?;
+        if !doomed.is_empty() || repacked > 0 {
+            crate::info!("disk {}: gc deleted {} segments, repacked {} KiB", self.cfg.id, doomed.len(), repacked >> 10);
+        }
+        Ok((doomed.len(), repacked))
+    }
+
+    /// Rewrite the live blocks of sparse segments (at or below `upto`) into the open segment, from the
+    /// local image. Done under the open-segment lock, so no write can append between reading a
+    /// block and appending its copy: the copy is never older than a write logged before it.
+    fn repack(&self, upto: (u64, u64)) -> Result<u64> {
+        let (victims, runs) = {
+            let map = self.cmap.lock().unwrap();
+            let live = map.live_blocks();
+            let budget = (self.cfg.repack_budget_mb << 20) / crate::extmap::BLOCK;
+            let v = crate::gc::repack_candidates(&live, &map.segs, &map.data_blocks, upto, self.cfg.repack_ratio, budget);
+            let set: BTreeSet<u32> = v.iter().map(|(i, _)| *i).collect();
+            let runs: Vec<(u64, u32)> = map.runs().into_iter().filter(|(_, _, s, _)| set.contains(s)).map(|(b, n, _, _)| (b, n)).collect();
+            (v, runs)
+        };
+        if victims.is_empty() {
+            return Ok(0);
+        }
+        let rd = File::open(self.image_path())?;
+        let mut bytes = 0u64;
+        let mut buf = Vec::new();
+        for (b, n) in runs {
+            let (off, len) = (b * crate::extmap::BLOCK, n as u64 * crate::extmap::BLOCK);
+            let mut o = self.open.lock().unwrap();
+            let range = self.intent_begin(off, len)?;
+            buf.resize(len as usize, 0);
+            rd.read_exact_at(&mut buf, off)?;
+            o.push_data(off, &buf);
+            let seq = self.next_seq.load(SeqCst);
+            drop(o);
+            self.intent_end(range, Some(seq));
+            bytes += len;
+        }
+        self.seal();
+        self.stats.gc_repacked_bytes.fetch_add(bytes, Relaxed);
+        Ok(bytes)
     }
 
     /// Hands sealed segments to the shared pool in seq order, at most WINDOW beyond the committed prefix.

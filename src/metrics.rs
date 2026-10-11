@@ -24,6 +24,9 @@ pub struct DiskSnapshot {
     pub flush_wait_seconds: f64,
     pub intent_syncs: u64,
     pub lag_waits: u64,
+    pub gc_deleted_segments: u64,
+    pub gc_deleted_bytes: u64,
+    pub gc_repacked_bytes: u64,
 }
 
 #[derive(serde::Serialize, Clone, Debug)]

@@ -32,6 +32,7 @@ CI runs the unit layer and the end-to-end suite on every pull request
 | `src/metrics.rs` | Prometheus exposition: HELP/TYPE per family, one sample per disk, every sample line parses; JSON snapshot round trip |
 | `src/logx.rs` | RFC 3339 UTC timestamps (including a leap day and 2099), level parsing and ordering |
 | `src/failpoint.rs` | failpoint spec parsing; malformed entries ignored |
+| `src/gc.rs` | deletion only of unreferenced data segments below the older checkpoint (tombstones and newer segments kept); keeping the last two checkpoints; repack candidates by live ratio, age and budget |
 | `src/track.rs` | a region needs persisting on first write only; bits clear only after the last write's segment is committed and nothing is in flight; failed writes do not pin a region; overlapping writes keep the latest segment; bitmap round trip (padding bits ignored); commit of out-of-order completions only as a contiguous prefix |
 
 ## End-to-end suite
@@ -64,6 +65,7 @@ CI runs the unit layer and the end-to-end suite on every pull request
 | `14_no_supervisor_auto_attach` | without the supervisor, a plain restart after `kill -9` re-attaches the existing device; data intact, writes work |
 | `15_metrics_and_ops` | `/metrics` serves every family and returns 404 for other paths; `puts_total` grows with writes; lag is 0 after a drain; `ctl metrics` matches HTTP; `stats json` parses; `check-config` accepts a valid config and rejects duplicate ids; `--version`; log lines are timestamped and leveled |
 | `16_checkpoint_restore` | 20 overwrites of the same 8 MiB: drain writes a checkpoint; a restore uses it and fetches about 8 MiB of live data out of about 160 MiB uploaded; image identical |
+| `17_gc` | three rounds of overwrites, each followed by `ctl gc`: GC deletes dead segments; segments left in the store = uploaded − deleted; a restore after GC is byte-identical |
 
 Failpoints (`src/failpoint.rs`) let a case make the server fail at a named place:
 
@@ -104,8 +106,12 @@ example inside a `rust` container.
 - **Faults injected meanwhile**:
   - the worker is `SIGKILL`ed every 0.5–2 s; the supervisor restarts it;
   - 10% of uploads fail (`upload=error%10`) and are retried;
-  - every 1–3 s the store directory is copied. Objects are immutable once created, so a copy is
-    exactly what a host that died at that instant would leave behind.
+  - every 1–3 s the store directory is copied. Objects are only created (immutable) or deleted by
+    GC, so the copy lists the checkpoints first, then copies the segments (skipping any GC deletes
+    meanwhile), then only the checkpoints it listed. The result is a state the store really passed
+    through.
+  - checkpoints are taken every 8 segments, so GC deletes and repacks throughout (about 135 rounds
+    per 60 s run).
 
 Checks:
 

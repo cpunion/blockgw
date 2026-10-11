@@ -3,7 +3,7 @@
 
 use crate::store::{PutOutcome, Store};
 use anyhow::{anyhow, bail, Result};
-use rusty_s3::actions::{GetObject, ListObjectsV2, PutObject, S3Action};
+use rusty_s3::actions::{DeleteObject, GetObject, ListObjectsV2, PutObject, S3Action};
 use rusty_s3::{Bucket, Credentials, UrlStyle};
 use std::time::Duration;
 
@@ -74,7 +74,7 @@ impl Store for S3 {
         Ok(v)
     }
 
-    fn list(&self, prefix: &str) -> Result<Vec<String>> {
+    fn list_sized(&self, prefix: &str) -> Result<Vec<(String, u64)>> {
         let mut out = Vec::new();
         let mut token: Option<String> = None;
         loop {
@@ -86,7 +86,7 @@ impl Store for S3 {
             let url = a.sign(TTL);
             let body = self.agent.get(url.as_str()).call().map_err(|e| anyhow!("LIST {prefix}: {e}"))?.into_string()?;
             let resp = ListObjectsV2::parse_response(&body).map_err(|e| anyhow!("LIST parse: {e}"))?;
-            out.extend(resp.contents.into_iter().map(|c| c.key));
+            out.extend(resp.contents.into_iter().map(|c| (c.key, c.size)));
             match resp.next_continuation_token {
                 Some(t) => token = Some(t),
                 None => break,
@@ -94,5 +94,13 @@ impl Store for S3 {
         }
         out.sort();
         Ok(out)
+    }
+
+    fn delete(&self, key: &str) -> Result<()> {
+        let url = DeleteObject::new(&self.bucket, Some(&self.creds), key).sign(TTL);
+        match self.agent.delete(url.as_str()).call() {
+            Ok(_) | Err(ureq::Error::Status(404, _)) => Ok(()),
+            Err(e) => Err(anyhow!("DELETE {key}: {e}")),
+        }
     }
 }

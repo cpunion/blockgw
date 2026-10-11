@@ -15,6 +15,7 @@
 mod dev;
 mod extmap;
 mod failpoint;
+mod gc;
 mod log;
 mod logx;
 mod metrics;
@@ -405,6 +406,20 @@ fn handle_ctl(s: UnixStream, devs: &[Arc<Dev>]) -> Result<()> {
             v.join("\n")
         }
         ["stats", "json"] => serde_json::to_string(&snapshot(devs))?,
+        ["gc", id] => match find(id) {
+            Some(d) => {
+                // drain and checkpoint first, so the round sees everything committed
+                let need = d.seal();
+                while d.committed.load(SeqCst) < need && !d.fenced.load(SeqCst) {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                match d.checkpoint().and_then(|_| d.gc_round()) {
+                    Ok((n, b)) => format!("ok disk {id} gc deleted {n} segments, repacked {b} bytes"),
+                    Err(e) => format!("error: {e:#}"),
+                }
+            }
+            None => "error: no such disk".into(),
+        },
         ["metrics"] => metrics::render_prometheus(&snapshot(devs)).trim_end().to_string(),
         _ => "error: unknown command".into(),
     };

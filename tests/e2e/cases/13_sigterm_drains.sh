@@ -7,7 +7,7 @@ id=$(cfg_ids "$cfg")
 ctl "$cfg" lag "$id" 1024 >/dev/null
 mkfs_mount "$id" "$W/m"
 rand_file "$W/m/f.bin" $((48 << 20))
-umount "$W/m"                               # local policy: flushes return before the uploads finish
+umount_ok "$W/m"                               # local policy: flushes return before the uploads finish
 q=$(stat "$cfg" "$id" queued_bytes); log "metric: queued at SIGTERM: $q bytes"
 sup=$(cat "${cfg%.json}.pid")
 kill -TERM "$sup"

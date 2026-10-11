@@ -228,6 +228,34 @@ device is attached:
   - The segment's size is the dirty data, which write-intent tracking keeps close to the upload lag
     at the time of the crash.
 
+### 3.5a Garbage collection
+
+After each checkpoint, a GC round runs against the last two checkpoints this server knows of. The
+checkpoint the disk was opened from counts as the first.
+
+1. **Ownership**: if an epoch marker newer than the server's own exists, the server marks itself
+   fenced and stops. Only the current owner deletes.
+2. **Delete segments**: a data segment may be deleted when it is at or below the position of the
+   *older* checkpoint and *neither* checkpoint references it.
+   - Keeping two checkpoints' worth covers a reader that listed the older checkpoint just before
+     the newer one was written.
+   - **Tombstones (4-byte objects) are never deleted**: a fenced writer that is still running must
+     keep colliding with them.
+3. **Delete old checkpoints**: those older than the older of the two.
+4. **Repack**: segments at or below the newer checkpoint whose live fraction is below
+   `repack_ratio` (default 0.5) have their live blocks copied from the local image into the open
+   segment, oldest first, within `repack_budget_mb` per round (default 64).
+   - This runs under the open-segment lock, so no write can append between reading a block and
+     appending its copy; a copy is never older than a write logged before it.
+   - Once the copies commit, the old segment is no longer referenced and is deleted two checkpoints
+     later.
+
+**Replay after GC**: below a checkpoint, GC leaves gaps, so replay only requires contiguity *after*
+the checkpoint position: `cs + 1, cs + 2, ...` in the checkpoint's epoch, and from 0 in later epochs.
+
+The torture test runs with a checkpoint every 8 segments, so GC deletes and repacks throughout:
+about 135 rounds per 60 s run. Every store copy still restores to an exact prefix of the writes.
+
 ### 3.6 Write-intent regions
 
 - A bit per 4 MiB region, stored in `<dir>/intent`.
@@ -283,11 +311,10 @@ device is attached:
 
 ## 6. Not implemented yet
 
-1. Lazy cold reads: today the full image lives on the host and a restore downloads every segment.
-2. Garbage collection and repacking: dead segments are never deleted (the extent map already knows
-   what is live).
-4. Encryption at rest.
-5. Standby replication of unflushed writes.
+1. Lazy cold reads: today the full image lives on the host. A restore downloads the live data (not
+   the history), but all of it.
+2. Encryption at rest.
+3. Standby replication of unflushed writes.
 
 ## 7. Alternatives considered
 
