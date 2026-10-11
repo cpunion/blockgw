@@ -1,0 +1,7 @@
+{
+  "local_store": "/var/lib/blockgw/store",
+  "control_socket": "/run/blockgw.sock",
+  "devices": [
+    { "id": 0, "size_gb": 8, "dir": "/var/lib/blockgw/disk0", "prefix": "disks/disk0" }
+  ]
+}

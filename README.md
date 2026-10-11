@@ -5,7 +5,7 @@
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
 
 Virtual block devices for Linux that run at local-disk speed and persist to S3-compatible object
-storage.
+storage, or to a local directory.
 
 One `blockgw` process per host serves all of that host's virtual disks through
 [ublk](https://docs.kernel.org/block/ublk.html), the io_uring-based userspace block driver. Each
@@ -112,13 +112,15 @@ Requirements:
   `linux-modules-extra-$(uname -r)`.
 - Root.
 - An S3-compatible bucket with conditional writes (`If-None-Match: *`). AWS S3, Cloudflare R2,
-  SeaweedFS and MinIO support them.
+  SeaweedFS and MinIO support them. For development and tests, or with a second disk or NAS mount as
+  the durable copy, a local directory works too (`"local_store": "/path"`, see
+  [examples/config.local.json](examples/config.local.json)).
 - To build: Rust 1.85 or newer, plus `clang` and `libclang-dev`, which libublk's bindgen step needs.
 
 ```sh
 cargo build --release
 sudo modprobe ublk_drv
-cp examples/config.json /etc/blockgw.json   # edit endpoint, bucket, credentials, disks
+cp examples/config.json /etc/blockgw.json   # edit endpoint, bucket, credentials, disks (or use config.local.json)
 sudo MALLOC_ARENA_MAX=2 target/release/blockgw serve /etc/blockgw.json &   # supervisor + worker
 sudo mkfs.xfs /dev/ublkb0 && sudo mount /dev/ublkb0 /mnt
 
@@ -137,12 +139,14 @@ Running the service:
 - **Moving a disk**: unmount it, run `drain`, stop the service, then start a server with the same
   `prefix` on the new host. The image is restored from the object store.
 
+On macOS or Windows, run blockgw in a Linux VM; see [docs/local-dev.md](docs/local-dev.md).
+
 ## Testing
 
 - `cargo test`: unit tests for the segment format, replay and fencing rules, write-intent tracking
   and in-order commit.
-- `sudo tests/e2e/run.sh`: fourteen end-to-end cases against real ublk devices and a local
-  SeaweedFS (crash recovery, supervisor restart, orphan timeout, graceful drain, restore, fencing,
+- `sudo tests/e2e/run.sh`: fourteen end-to-end cases against real ublk devices, with a local
+  SeaweedFS or (`E2E_STORE=dir`) a local-directory store (crash recovery, supervisor restart, orphan timeout, graceful drain, restore, fencing,
   policy switch, discard, multi-disk, idle requests, ...).
 - `bench/bench.sh`: the benchmark behind the numbers above.
 
@@ -156,6 +160,8 @@ See [docs/testing.md](docs/testing.md).
 3. Encryption at rest (per-disk keys).
 4. Optional streaming of unflushed writes to a standby.
 5. Zero-copy ublk (Linux 6.15+) and a systematic crash-consistency test matrix.
+6. Native macOS and Windows frontends (research: an iSCSI target for Windows' built-in initiator;
+   an FSKit-served image file attached with `hdiutil` on macOS).
 
 ## Contributing
 

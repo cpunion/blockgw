@@ -27,8 +27,14 @@ write_config() {
     echo "$id" >> "$W/ids"
     devs+="${devs:+,}{\"id\":$id,\"size_gb\":$size,\"dir\":\"$W/$name/d$i\",\"prefix\":\"$PREFIX/$key\",\"policy\":\"$policy\"}"
   done
+  local store
+  if [ "${E2E_STORE:-s3}" = dir ]; then
+    store="\"local_store\":\"$W/store\""   # shared by every server of this case, like a bucket
+  else
+    store="\"s3\":{\"endpoint\":\"$S3_ENDPOINT\",\"region\":\"${S3_REGION:-us-east-1}\",\"bucket\":\"$S3_BUCKET\",\"access_key\":\"$S3_ACCESS_KEY\",\"secret_key\":\"$S3_SECRET_KEY\",\"path_style\":true}"
+  fi
   cat > "$cfg" <<EOF
-{"s3":{"endpoint":"$S3_ENDPOINT","region":"${S3_REGION:-us-east-1}","bucket":"$S3_BUCKET","access_key":"$S3_ACCESS_KEY","secret_key":"$S3_SECRET_KEY","path_style":true},
+{$store,
  "control_socket":"$W/$name.sock","upload_workers":8,"devices":[$devs]}
 EOF
   echo "$cfg"

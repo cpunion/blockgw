@@ -49,6 +49,25 @@ than stacking device-mapper targets whose write-back order is unrelated to files
 
 ## 3. Contract
 
+### 3.0 Object stores
+
+The log needs three operations from its store:
+
+- a **create-only PUT**, which fails if the key exists; fencing rests on it;
+- **GET**;
+- **LIST** of a prefix in lexicographic order.
+
+Two stores implement them:
+
+| Store | Create-only | Durability |
+|---|---|---|
+| S3-compatible (`"s3"`) | `If-None-Match: *`. A 412 or 409 response means the key exists | the provider's |
+| Local directory (`"local_store"`) | write a temporary file, fsync it, then `link(2)` it to the key's path; EEXIST means the key exists | the directory's filesystem; the parent directory is fsync'd after each new key |
+
+A local directory serves development and tests, or a second disk or NAS mount as the durable copy.
+Two hosts can fence each other through it only if they share the directory. On NFS, `link` is the
+classic exclusive-create primitive, but that path is untested.
+
 ### 3.1 Disk identity and ownership
 
 - A disk is an object prefix (`<prefix>/`), a size, and a sequence of epochs.

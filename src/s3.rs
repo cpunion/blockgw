@@ -1,6 +1,7 @@
 //! Minimal blocking S3 client: presigned URLs (rusty-s3) over ureq. Create-only PUTs carry a signed
 //! `If-None-Match: *` header; a 412/409 answer means another writer got the key first.
 
+use crate::store::{PutOutcome, Store};
 use anyhow::{anyhow, bail, Result};
 use rusty_s3::actions::{GetObject, ListObjectsV2, PutObject, S3Action};
 use rusty_s3::{Bucket, Credentials, UrlStyle};
@@ -23,11 +24,6 @@ pub struct S3 {
     agent: ureq::Agent,
 }
 
-pub enum PutOutcome {
-    Created,
-    Exists,
-}
-
 const TTL: Duration = Duration::from_secs(600);
 
 impl S3 {
@@ -37,9 +33,11 @@ impl S3 {
         let agent = ureq::AgentBuilder::new().timeout_connect(Duration::from_secs(10)).timeout(Duration::from_secs(120)).build();
         Ok(S3 { bucket, creds: Credentials::new(c.access_key.clone(), c.secret_key.clone()), agent })
     }
+}
 
+impl Store for S3 {
     /// Create-only PUT. `Exists` when the key is already there (S3 412, some stores 409).
-    pub fn put_new(&self, key: &str, body: &[u8]) -> Result<PutOutcome> {
+    fn put_new(&self, key: &str, body: &[u8]) -> Result<PutOutcome> {
         let mut a = PutObject::new(&self.bucket, Some(&self.creds), key);
         a.headers_mut().insert("if-none-match", "*");
         let url = a.sign(TTL);
@@ -51,7 +49,7 @@ impl S3 {
         }
     }
 
-    pub fn get(&self, key: &str) -> Result<Vec<u8>> {
+    fn get(&self, key: &str) -> Result<Vec<u8>> {
         let url = GetObject::new(&self.bucket, Some(&self.creds), key).sign(TTL);
         let r = self.agent.get(url.as_str()).call().map_err(|e| anyhow!("GET {key}: {e}"))?;
         let mut v = Vec::new();
@@ -60,7 +58,7 @@ impl S3 {
     }
 
     /// All keys under `prefix`, lexicographically sorted (keys use zero-padded numbers).
-    pub fn list(&self, prefix: &str) -> Result<Vec<String>> {
+    fn list(&self, prefix: &str) -> Result<Vec<String>> {
         let mut out = Vec::new();
         let mut token: Option<String> = None;
         loop {

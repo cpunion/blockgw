@@ -12,7 +12,7 @@
 //! next open before the device is attached.
 
 use crate::log::{self, SegmentBuilder};
-use crate::s3::{PutOutcome, S3};
+use crate::store::{PutOutcome, Store};
 use crate::track::{CommitTracker, RegionTracker};
 use anyhow::{bail, Context, Result};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -122,7 +122,7 @@ pub struct Dev {
 impl Dev {
     /// Open the disk: claim a new epoch (fencing any previous writer), catch up with segments other
     /// hosts wrote (or restore everything on a fresh host), and note regions a crashed run left dirty.
-    pub fn open(cfg: DevConfig, s3: &S3) -> Result<Dev> {
+    pub fn open(cfg: DevConfig, s3: &dyn Store) -> Result<Dev> {
         let dir = PathBuf::from(&cfg.dir);
         std::fs::create_dir_all(&dir)?;
         let size = cfg.size_gb << 30;
@@ -445,7 +445,7 @@ impl Dev {
 
 /// Claim epoch `last+1` with a create-only marker, then tombstone the previous epoch's free seqs so
 /// that its writer's next upload collides (docs/design.md §3.4).
-fn claim_epoch(s3: &S3, p: &str) -> Result<u64> {
+fn claim_epoch(s3: &dyn Store, p: &str) -> Result<u64> {
     loop {
         let last = s3.list(&format!("{p}/epoch/"))?.iter().filter_map(|k| log::parse_epoch_key(k)).max().unwrap_or(0);
         if let PutOutcome::Exists = s3.put_new(&log::key_epoch(p, last + 1), b"")? {
@@ -482,7 +482,7 @@ impl Pool {
     }
 
     /// Compress (skipped for incompressible data), create-only PUT, retry transient errors.
-    pub fn worker(&self, s3: &S3) {
+    pub fn worker(&self, s3: &dyn Store) {
         loop {
             let (dev, seq, raw) = {
                 let mut j = self.jobs.lock().unwrap();
