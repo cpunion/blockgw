@@ -1,0 +1,24 @@
+# systemd unit for blockgw. The supervisor (`serve`) restarts a crashed worker on its own; systemd
+# restarts the supervisor if it exits (for example after an orphan timeout).
+[Unit]
+Description=blockgw virtual disks (ublk + object storage)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStartPre=/sbin/modprobe ublk_drv
+ExecStartPre=/usr/local/bin/blockgw check-config /etc/blockgw.json
+ExecStart=/usr/local/bin/blockgw serve /etc/blockgw.json --orphan-timeout 30
+Environment=MALLOC_ARENA_MAX=2
+Environment=BLOCKGW_LOG=info
+# SIGTERM drains every disk's upload queue (up to 60 s per disk) before exiting
+KillSignal=SIGTERM
+KillMode=mixed
+TimeoutStopSec=120
+Restart=on-failure
+RestartSec=2
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

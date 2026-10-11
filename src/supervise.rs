@@ -111,7 +111,7 @@ pub fn supervise(config: &str, ids: &[i32], orphan_timeout: Duration) -> Result<
                 backoff = Duration::from_millis(200);
             } else if let Some(t) = down_since {
                 if t.elapsed() > orphan_timeout {
-                    eprintln!("supervisor: devices without a live server for {:?}; stopping the worker", t.elapsed());
+                    crate::warn!("supervisor: devices without a live server for {:?}; stopping the worker", t.elapsed());
                     let _ = child.kill();
                     let _ = child.wait();
                     break std::process::ExitStatus::default(); // handled below as an orphan timeout
@@ -126,13 +126,13 @@ pub fn supervise(config: &str, ids: &[i32], orphan_timeout: Duration) -> Result<
         }
         let since = *down_since.get_or_insert_with(Instant::now);
         if since.elapsed() > orphan_timeout {
-            eprintln!("supervisor: orphan timeout ({orphan_timeout:?}) exceeded; failing devices {ids:?}");
+            crate::warn!("supervisor: orphan timeout ({orphan_timeout:?}) exceeded; failing devices {ids:?}");
             for id in ids {
                 fail_device(*id);
             }
             return Ok(1);
         }
-        eprintln!("supervisor: worker exited ({status}) after {:?}; restarting in {backoff:?}", started.elapsed());
+        crate::warn!("supervisor: worker exited ({status}) after {:?}; restarting in {backoff:?}", started.elapsed());
         std::thread::sleep(backoff);
         backoff = (backoff * 2).min(Duration::from_secs(2));
     }

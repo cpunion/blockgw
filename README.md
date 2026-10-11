@@ -127,9 +127,11 @@ sudo mkfs.xfs /dev/ublkb0 && sudo mount /dev/ublkb0 /mnt
 target/release/blockgw ctl /run/blockgw.sock stats
 target/release/blockgw ctl /run/blockgw.sock policy 0 remote   # fsync now waits for S3
 target/release/blockgw ctl /run/blockgw.sock drain 0           # upload everything sealed so far
+target/release/blockgw ctl /run/blockgw.sock metrics           # Prometheus text (also at metrics_addr)
 ```
 
-Running the service:
+Running the service (a systemd unit is in [examples/blockgw.service](examples/blockgw.service); metrics,
+alerts and the control socket are in [docs/operations.md](docs/operations.md)):
 
 - **Restarts**: the supervisor restarts a crashed worker by itself. A fresh `blockgw serve` after the
   whole service died also re-attaches devices that are waiting for a server, and adds any that are
@@ -145,9 +147,10 @@ On macOS or Windows, run blockgw in a Linux VM; see [docs/local-dev.md](docs/loc
 
 - `cargo test`: unit tests for the segment format, replay and fencing rules, write-intent tracking
   and in-order commit.
-- `sudo tests/e2e/run.sh`: fourteen end-to-end cases against real ublk devices, with a local
-  SeaweedFS or (`E2E_STORE=dir`) a local-directory store (crash recovery, supervisor restart, orphan timeout, graceful drain, restore, fencing,
-  policy switch, discard, multi-disk, idle requests, ...).
+- `sudo tests/e2e/run.sh`: fifteen end-to-end cases against real ublk devices, with a local
+  SeaweedFS or (`E2E_STORE=dir`) a local-directory store (crash recovery, supervisor restart, orphan
+  timeout, graceful drain, restore, fencing, policy switch, discard, multi-disk, idle requests,
+  metrics, ...).
 - `bench/bench.sh`: the benchmark behind the numbers above.
 
 See [docs/testing.md](docs/testing.md).

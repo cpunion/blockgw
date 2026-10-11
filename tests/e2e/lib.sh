@@ -33,8 +33,10 @@ write_config() {
   else
     store="\"s3\":{\"endpoint\":\"$S3_ENDPOINT\",\"region\":\"${S3_REGION:-us-east-1}\",\"bucket\":\"$S3_BUCKET\",\"access_key\":\"$S3_ACCESS_KEY\",\"secret_key\":\"$S3_SECRET_KEY\",\"path_style\":true}"
   fi
+  local extra=""
+  [ -n "${METRICS_ADDR:-}" ] && extra=",\"metrics_addr\":\"$METRICS_ADDR\""
   cat > "$cfg" <<EOF
-{$store,
+{$store$extra,
  "control_socket":"$W/$name.sock","upload_workers":8,"devices":[$devs]}
 EOF
   echo "$cfg"
