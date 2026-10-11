@@ -76,6 +76,7 @@ CI runs the unit layer and the end-to-end suite on every pull request
 | `23_attach_detach` | with `devices_dir`: attach; detach refused while mounted; detach and re-attach reuses the local image; detach with `purge` and re-attach restores lazily from the store; a worker crash re-attaches from `devices_dir`; conflicting ids or prefixes are refused |
 | `24_key_rotation` | a disk written under key A opens with key B plus A as an old key; B alone cannot open it, and that failed open does not fence the live writer; `rekey` rewrites the old data; B alone then restores the whole device on a fresh host |
 | `25_cache_eviction` | with `cache_mb=48`, writing 160+ MiB leaves the image within the budget; the big file and a tree read back correctly after eviction, across a worker kill and after a restart |
+| `26_replica` | with a standby and uploads blocked, an 8 MiB fsynced write is acknowledged (60 ms); the primary host is lost (killed, image deleted) and a new host restores the write from the standby's journal; with the standby down, fsync falls back to the object store |
 
 Failpoints (`src/failpoint.rs`) let a case make the server fail at a named place:
 
@@ -200,6 +201,11 @@ At every takeover:
 At the end, the last owner holds its whole history and a fresh restore equals it. A 45 s run makes
 10–13 takeovers.
 
+With `--replica`, a standby runs, and every takeover loses the old host instead (supervisor and
+worker killed, local image deleted): the new owner must hold every write acknowledged by fsync,
+under `local` too. Wiping the standby's journal before each takeover makes this fail within the
+first takeover.
+
 Its first run found a lazy-restore bug: after a worker crash, recovery re-uploaded only blocks the
 (stale) presence bitmap marked present, dropping writes to blocks that had never been fetched while
 keeping later ones. See §3.5b of the design; e2e case `21_lazy_crash_order` reproduces it
@@ -253,6 +259,7 @@ test for 45 minutes and the 4-writer, XFS and takeover tortures for 20 minutes e
 | XFS, local policy, 32 MiB cache | `fstorture.py --policy local --cache-mb 32` |
 | takeovers, local policy | `fencetorture.py --policy local` |
 | takeovers, remote policy | `fencetorture.py --policy remote` |
+| host loss with a standby, local policy | `fencetorture.py --policy local --replica` |
 
 ## Benchmark
 

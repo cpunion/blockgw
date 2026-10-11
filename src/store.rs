@@ -32,6 +32,15 @@ pub trait Store: Send + Sync {
     fn needs_old_key(&self, _key: &str) -> Result<bool> {
         Ok(false)
     }
+    /// Seal a blob that is kept outside the store (the standby journal) as this store would seal an
+    /// object named `name`: encrypted stores encrypt it, others return it as is.
+    fn seal_blob(&self, _name: &str, body: Vec<u8>) -> Result<Vec<u8>> {
+        Ok(body)
+    }
+    /// Inverse of `seal_blob`.
+    fn open_blob(&self, _name: &str, blob: Vec<u8>) -> Result<Vec<u8>> {
+        Ok(blob)
+    }
 }
 
 /// Objects as files under a root directory (key `a/b/c` is file `<root>/a/b/c`). Useful for local

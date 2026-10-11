@@ -16,11 +16,10 @@ out the first.
 
 > **Status: beta.** The write path, crash recovery and supervision, checkpointed and lazy restore,
 > garbage collection, fencing, encryption at rest with key rotation, a bounded local cache and
-> runtime attach/detach work, and are checked
-> on every pull request by 25 end-to-end cases and 10 crash-consistency torture jobs (block level,
-> XFS level and takeovers), plus a daily soak; the suite also passes against Cloudflare R2. Not yet:
-> standby replication (under `local`, losing a host loses up to `seal_interval_ms` plus the upload
-> lag) and production mileage. See [Roadmap](#roadmap).
+> runtime attach/detach and standby replication work, and are checked on every pull request by 26
+> end-to-end cases and 11 crash-consistency torture jobs (block level, XFS level, takeovers, host
+> loss with a standby), plus a daily soak; the suite also passes against Cloudflare R2. Not yet:
+> production mileage. See [Roadmap](#roadmap).
 
 ## Why
 
@@ -164,7 +163,7 @@ On macOS or Windows, run blockgw in a Linux VM; see [docs/local-dev.md](docs/loc
 
 - `cargo test`: unit tests for the segment format, replay and fencing rules, write-intent tracking
   and in-order commit.
-- `sudo tests/e2e/run.sh`: twenty-five end-to-end cases against real ublk devices, with a local
+- `sudo tests/e2e/run.sh`: twenty-six end-to-end cases against real ublk devices, with a local
   SeaweedFS or (`E2E_STORE=dir`) a local-directory store (crash recovery, supervisor restart, orphan
   timeout, graceful drain, restore, fencing, policy switch, discard, multi-disk, idle requests,
   metrics, checkpoint restore, garbage collection, lazy restore, encryption, ...).
@@ -184,9 +183,8 @@ See [docs/testing.md](docs/testing.md).
 
 ## Roadmap
 
-1. Optional streaming of unflushed writes to a standby.
-2. Zero-copy ublk (Linux 6.15+).
-3. Native macOS and Windows frontends (research: an iSCSI target for Windows' built-in initiator;
+1. Zero-copy ublk (Linux 6.15+).
+2. Native macOS and Windows frontends (research: an iSCSI target for Windows' built-in initiator;
    an FSKit-served image file attached with `hdiutil` on macOS).
 
 ## Contributing

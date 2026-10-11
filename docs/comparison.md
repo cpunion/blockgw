@@ -89,7 +89,7 @@ ZeroFS ran on a 4-vCPU host and blockgw on a 3-vCPU host; ext4 is each host's ow
 | | ZeroFS | blockgw |
 |---|---|---|
 | Gateway crash | unflushed acknowledged writes are lost on a single gateway | `local`: the image is on local disk, so nothing is lost if the host survives (the restarted worker re-uploads the tail); `remote`: nothing acknowledged is lost |
-| Standby | Connected HA keeps unflushed writes alive on a standby: all 5,617–6,693 acknowledged records survived a leader kill in our tests, with the standby serving 6–7 s later | not implemented (roadmap) |
+| Standby | Connected HA keeps unflushed writes alive on a standby: all 5,617–6,693 acknowledged records survived a leader kill in our tests, with the standby serving 6–7 s later | `replica`: a standby journal keeps acknowledged writes; the takeover torture with host loss checks that every fsync-acknowledged write survives |
 | Single writer | writer fencing is built in: a second instance on the same prefix fences the first within about 1 s | writer fencing is built in too (epochs plus tombstones) |
 
 ### Where ZeroFS is the better choice
@@ -97,7 +97,7 @@ ZeroFS ran on a 4-vCPU host and blockgw on a 3-vCPU host; ext4 is each host's ow
 - You need file-level sharing (NFS / 9P).
 - Hosts cannot hold a full copy of each disk: ZeroFS keeps data in S3 with a bounded cache. blockgw
   restores lazily, but hydrates to the full image and has no eviction yet.
-- You need standby replication today.
+- You need file-level access from several clients at once.
 
 ## Block-per-object designs (s3backer, nbdkit S3)
 

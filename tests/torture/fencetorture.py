@@ -19,7 +19,7 @@ At the end:
 Usage: sudo tests/torture/fencetorture.py --blockgw target/release/blockgw [--policy local|remote]
                                           [--seconds 60] [--seed N] [--encrypt]
 """
-import argparse, mmap, os, random, shutil, signal, subprocess, sys, threading, time
+import argparse, mmap, os, random, shutil, signal, socket, subprocess, sys, threading, time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from torture import BS, Server, block_bytes, delete_device, dev_node, log, parse_block, write_config  # noqa: E402
@@ -63,13 +63,16 @@ def main():
     ap.add_argument("--work", default="/tmp/blockgw-fencetorture")
     ap.add_argument("--upload-error-pct", type=int, default=10)
     ap.add_argument("--encrypt", action="store_true")
+    ap.add_argument("--replica", action="store_true",
+                    help="run a standby; every takeover loses the old host (killed, local image deleted), "
+                         "and every fsync-acknowledged write must survive, under either policy")
     a = ap.parse_args()
     blockgw = os.path.abspath(a.blockgw)
     rng = random.Random(a.seed)
     work = os.path.join(a.work, f"{a.policy}{'-enc' if a.encrypt else ''}-{a.seed}")
     shutil.rmtree(work, ignore_errors=True)
     os.makedirs(work)
-    log(f"seed={a.seed} policy={a.policy} encrypt={a.encrypt} seconds={a.seconds} work={work}")
+    log(f"seed={a.seed} policy={a.policy} encrypt={a.encrypt} replica={a.replica} seconds={a.seconds} work={work}")
     key_file = None
     if a.encrypt:
         key_file = os.path.join(work, "disk.key")
@@ -80,11 +83,26 @@ def main():
     next_id = [a.id]
     servers = []  # every server started, for cleanup: (Server, dev_id)
 
+    replica_addr, replica_proc = None, None
+    if a.replica:
+        sk = socket.socket()
+        sk.bind(("127.0.0.1", 0))
+        replica_addr = f"127.0.0.1:{sk.getsockname()[1]}"
+        sk.close()
+        replica_proc = subprocess.Popen([blockgw, "replica", "--listen", replica_addr, "--dir", os.path.join(work, "journal")],
+                                        stdout=open(os.path.join(work, "replica.log"), "ab"), stderr=subprocess.STDOUT)
+        time.sleep(0.3)
+
     def start(name):
         dev_id = next_id[0]
         next_id[0] += 1
         cfg = os.path.join(work, f"{name}.json")
         write_config(cfg, store, os.path.join(work, f"img-{name}"), dev_id, a.policy, key_file)
+        if replica_addr:
+            import json
+            c = json.load(open(cfg))
+            c["devices"][0]["replica"] = replica_addr
+            json.dump(c, open(cfg, "w"))
         s = Server(blockgw, cfg, ["--orphan-timeout", "120"], env)
         servers.append((s, dev_id))
         s.wait_ready(dev_id)
@@ -144,14 +162,20 @@ def main():
             stop_kill.set()
             kt.join()
 
-            # takeover: a new server opens the disk while the old one keeps running
+            # takeover: a new server opens the disk while the old one keeps running (or, with a
+            # standby, after the old host is lost)
             acked_before, issued = acked, len(history)
+            zombie, t0, eio = set(), time.time(), False
+            if a.replica:
+                os.close(fd)
+                stop(cur, cur_id)
+                shutil.rmtree(os.path.join(work, f"img-s{n - 1}"), ignore_errors=True)
+                eio = True
             new, new_id = start(f"s{n}")
             n += 1
             takeovers += 1
             # split brain: the old owner keeps taking writes until it notices it was fenced
-            zombie, t0, eio = set(), time.time(), False
-            while time.time() - t0 < 30:
+            while not a.replica and time.time() - t0 < 30:
                 try:
                     b = rng.randrange(NBLOCKS)
                     zombie.add(write(fd, b))
@@ -164,8 +188,9 @@ def main():
                 fenced_after.append(time.time() - t0)
             else:
                 failures.append(f"takeover {takeovers}: the old owner still accepted writes 30 s after the takeover")
-            os.close(fd)
-            stop(cur, cur_id)
+            if not a.replica:
+                os.close(fd)
+                stop(cur, cur_id)
             # the new owner's view
             try:
                 gids = read_gids(new_id)
@@ -175,7 +200,7 @@ def main():
                 k = prefix_len(history, gids)
                 if k > issued:
                     raise AssertionError(f"holds {k} writes but only {issued} were issued before the takeover")
-                if a.policy == "remote" and k < acked_before:
+                if (a.policy == "remote" or a.replica) and k < acked_before:
                     raise AssertionError(f"holds {k} writes but {acked_before} were acknowledged by fsync before the takeover")
                 log(f"takeover {takeovers}: new owner holds the first {k} of {issued} writes (acked {acked_before}); "
                     f"old owner fenced after {fenced_after[-1] if eio else float('nan'):.2f} s, {len(zombie)} writes dropped")
@@ -206,6 +231,8 @@ def main():
                 failures.append(f"final: {e}")
         log(f"{takeovers} takeovers, {kills[0]} worker kills, {gid_counter[0]} writes issued")
     finally:
+        if replica_proc:
+            replica_proc.kill()
         for s, dev_id in servers:
             if s.proc.poll() is None:
                 try:

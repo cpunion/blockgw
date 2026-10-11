@@ -104,6 +104,7 @@ Suggested alerts:
 |---|---|---|
 | `policy` | `local` | durability policy at start (switchable at runtime) |
 | `max_lag_mb` | 16 | upload lag allowed under `local` before writers wait |
+| `replica` | none | `host:port` of a standby (`blockgw replica`); under `local` a flush returns once the standby has the data |
 | `cache_mb` | 0 | keep at most this much of the disk's data on the host (0 = all); cold committed regions are dropped and fetched again when read |
 | `seal_interval_ms` | 1000 | seal the open segment once its oldest write is this old; under `local` flushes do not seal, so this sets the PUT rate and adds to the loss window (0 = seal at every flush) |
 | `checkpoint_every` | 64 | committed segments between checkpoints (also every 60 s if anything committed) |
@@ -116,6 +117,27 @@ Suggested alerts:
 | `key_file` | none | encrypt every object of the disk with the 32-byte key in this file |
 | `old_key_files` | `[]` | earlier keys, used only to read objects sealed before a rotation |
 | `depth`, `queues` | 32, 1 | ublk queue depth and number of queues |
+
+## Standby replication
+
+Run a standby on another host (same LAN), with its own disk for the journal:
+
+```sh
+blockgw replica --listen 10.0.0.12:7700 --dir /var/lib/blockgw/journal
+```
+
+and set `"replica": "10.0.0.12:7700"` on the disks it should protect. Under `local`, a flush then
+returns once the standby has the data (a LAN round trip plus its fsync); losing the primary host
+loses no acknowledged write. Opening the disk on another host first uploads what only the standby
+has. Notes:
+
+- One standby can serve many primaries and disks; its journal holds only the not-yet-uploaded tail.
+- If the standby is down, flushes wait for the object store instead (as under `remote`) and the log
+  says `replica … unavailable`; when it is back, replication resumes by itself.
+- A disk cannot be opened on a new host while its standby is unreachable (the last acknowledged
+  writes may be only there). To open it anyway, accepting that loss, remove `replica` from it.
+- The standby port has no authentication: keep it on a private network. Encrypted disks send only
+  ciphertext.
 
 ## Encryption keys
 

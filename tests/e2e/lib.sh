@@ -17,7 +17,7 @@ now_ms() { date +%s%3N; }
 # ID_BASE + slot, image dir $W/NAME/d<i>, object prefix $PREFIX/<shared-or-own key>.
 # DISK_KEYS (optional, space-separated) overrides the per-disk prefix keys so two servers can
 # address the same disk. Optional per-disk settings from the environment: CKPT_EVERY, LAZY,
-# HYDRATE_MBPS, KEY_FILE, OLD_KEY_FILE, SEAL_INTERVAL_MS, CACHE_MB. Runs inside $(...), so the slot counter lives in $W/ids, not in a variable.
+# HYDRATE_MBPS, KEY_FILE, OLD_KEY_FILE, SEAL_INTERVAL_MS, CACHE_MB, REPLICA. Runs inside $(...), so the slot counter lives in $W/ids, not in a variable.
 write_config() {
   local name=$1 n=$2 size=$3 policy=${4:-local} devs="" i key id
   local cfg=$W/$name.json   # separate statement: $name must be the local one
@@ -26,7 +26,7 @@ write_config() {
     key=${keys[$i]:-$name-d$i}
     id=$((ID_BASE + $(wc -l < "$W/ids")))
     echo "$id" >> "$W/ids"
-    devs+="${devs:+,}{\"id\":$id,\"size_gb\":$size,\"dir\":\"$W/$name/d$i\",\"prefix\":\"$PREFIX/$key\",\"policy\":\"$policy\"${CKPT_EVERY:+,\"checkpoint_every\":$CKPT_EVERY}${LAZY:+,\"lazy\":$LAZY}${HYDRATE_MBPS:+,\"hydrate_mbps\":$HYDRATE_MBPS}${KEY_FILE:+,\"key_file\":\"$KEY_FILE\"}${OLD_KEY_FILE:+,\"old_key_files\":[\"$OLD_KEY_FILE\"]}${SEAL_INTERVAL_MS:+,\"seal_interval_ms\":$SEAL_INTERVAL_MS}${CACHE_MB:+,\"cache_mb\":$CACHE_MB}}"
+    devs+="${devs:+,}{\"id\":$id,\"size_gb\":$size,\"dir\":\"$W/$name/d$i\",\"prefix\":\"$PREFIX/$key\",\"policy\":\"$policy\"${CKPT_EVERY:+,\"checkpoint_every\":$CKPT_EVERY}${LAZY:+,\"lazy\":$LAZY}${HYDRATE_MBPS:+,\"hydrate_mbps\":$HYDRATE_MBPS}${KEY_FILE:+,\"key_file\":\"$KEY_FILE\"}${OLD_KEY_FILE:+,\"old_key_files\":[\"$OLD_KEY_FILE\"]}${SEAL_INTERVAL_MS:+,\"seal_interval_ms\":$SEAL_INTERVAL_MS}${CACHE_MB:+,\"cache_mb\":$CACHE_MB}${REPLICA:+,\"replica\":\"$REPLICA\"}}"
   done
   local store
   if [ "${E2E_STORE:-s3}" = dir ]; then
@@ -88,9 +88,17 @@ rss_kb() { ctl "$1" stats | awk '$1=="rss_kb"{print $2}'; }
 drain() { ctl "$1" drain "$2" > /dev/null; }
 image() { echo "$W/$1/d$2/data"; }   # image NAME DISK_INDEX
 
-mkfs_mount() { mkfs.xfs -q -f "/dev/ublkb$1" && mkdir -p "$2" && mount -o noatime,nouuid "/dev/ublkb$1" "$2" && echo "$2" >> "$W/mounts"; }
+# blkdev ID: a device node for ublk device ID made from its number in sysfs: /dev/ublkbN can be missing,
+# or briefly stale after an id is reused, where udev does not manage /dev (some containers)
+blkdev() {
+  local n p; n=$(cat "/sys/block/ublkb$1/dev" 2>/dev/null) || { echo "/dev/ublkb$1"; return; }
+  p="$W/dev/ublkb$1-${n/:/-}"
+  [ -b "$p" ] || { mkdir -p "$W/dev"; mknod "$p" b "${n%:*}" "${n#*:}"; }
+  echo "$p"
+}
+mkfs_mount() { mkfs.xfs -q -f "$(blkdev $1)" && mkdir -p "$2" && mount -o noatime,nouuid "$(blkdev $1)" "$2" && echo "$2" >> "$W/mounts"; }
 # remount ID DIR [EXTRA_OPTS]
-remount() { mkdir -p "$2" && mount -o "noatime,nouuid${3:+,$3}" "/dev/ublkb$1" "$2" && echo "$2" >> "$W/mounts"; }
+remount() { mkdir -p "$2" && mount -o "noatime,nouuid${3:+,$3}" "$(blkdev $1)" "$2" && echo "$2" >> "$W/mounts"; }
 
 # gen_tree DIR N SEED: N small files (0.5-16 KiB) of deterministic content in nested dirs
 gen_tree() {
@@ -108,7 +116,7 @@ rand_file() { head -c "$2" /dev/urandom > "$1"; }   # rand_file PATH BYTES
 file_hash() { sha256sum "$1" | cut -c1-16; }
 # dev_hash ID: hash of a whole ublk device read through the kernel (after a lazy restore this
 # fetches every mapped block on demand, so it checks the lazy read path)
-dev_hash() { dd if="/dev/ublkb$1" bs=1M iflag=direct status=none | sha256sum | cut -c1-16; }
+dev_hash() { dd if="$(blkdev $1)" bs=1M iflag=direct status=none | sha256sum | cut -c1-16; }
 # never clear the kernel ring buffer (other cases and later debugging need it): remember a position
 mark_dmesg() { DMESG_MARK=$(dmesg 2>/dev/null | wc -l); }
 kernel_errors() { dmesg 2>/dev/null | tail -n +$(( ${DMESG_MARK:-0} + 1 )) | grep -ciE "ublk.*(error|fail)|XFS \(ublkb.*(shut|error|corrupt)" || true; }

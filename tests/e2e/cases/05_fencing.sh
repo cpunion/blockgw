@@ -12,7 +12,7 @@ start_server "$r"
 gen_tree "$W/m/after" 200 6; sync -f "$W/m" 2>/dev/null; sleep 2
 echo x > "$W/m/late.txt" 2>/dev/null; sync -f "$W/m" 2>/dev/null; sleep 1
 assert_eq "$(stat "$cfg" "$id" fenced)" true "old writer fenced"
-if dd if=/dev/zero of="/dev/ublkb$id" bs=4k count=1 oflag=direct,sync status=none 2>/dev/null; then fail "write to a fenced disk succeeded"; fi
+if dd if=/dev/zero of="$(blkdev $id)" bs=4k count=1 oflag=direct,sync status=none 2>/dev/null; then fail "write to a fenced disk succeeded"; fi
 grep -q FENCED "${cfg%.json}.log" || fail "no FENCED log line"
 remount "$(cfg_ids "$r")" "$W/r"
 assert_eq "$(tree_hash "$W/r/before")" "$hb" "new writer sees everything committed before the takeover"
