@@ -58,6 +58,22 @@ impl Store for S3 {
     }
 
     /// All keys under `prefix`, lexicographically sorted (keys use zero-padded numbers).
+    fn get_range(&self, key: &str, off: u64, len: u64) -> Result<Vec<u8>> {
+        if len == 0 {
+            return Ok(Vec::new());
+        }
+        let url = GetObject::new(&self.bucket, Some(&self.creds), key).sign(TTL);
+        let r = self
+            .agent
+            .get(url.as_str())
+            .set("Range", &format!("bytes={}-{}", off, off + len - 1))
+            .call()
+            .map_err(|e| anyhow!("GET {key} range {off}+{len}: {e}"))?;
+        let mut v = Vec::new();
+        std::io::Read::read_to_end(&mut r.into_reader(), &mut v)?;
+        Ok(v)
+    }
+
     fn list(&self, prefix: &str) -> Result<Vec<String>> {
         let mut out = Vec::new();
         let mut token: Option<String> = None;

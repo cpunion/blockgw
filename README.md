@@ -14,9 +14,9 @@ Its history is a strictly ordered log of segments uploaded to S3, R2, or any S3-
 You can restore a disk on any host from the log alone, and a second host that opens the disk fences
 out the first.
 
-> **Status: experimental prototype.** The write path, crash recovery and supervision, restore and
-> fencing work and are covered by tests. Cold reads that fetch data lazily from S3, garbage collection, checkpoints
-> and encryption are not implemented yet. Do not use it for data you cannot afford to lose. See
+> **Status: experimental prototype.** The write path, crash recovery and supervision, checkpointed
+> restore and fencing work and are covered by tests. Cold reads that fetch data lazily from S3,
+> garbage collection and encryption are not implemented yet. Do not use it for data you cannot afford to lose. See
 > [Roadmap](#roadmap).
 
 ## Why
@@ -64,6 +64,12 @@ the durable, mobile copy, and it lets each disk choose when an `fsync` must reac
 - **Crash-consistent object store**: segments are cut at flush boundaries and committed in sequence
   order. Any prefix of the log is therefore a state the disk could have crashed into. A new host
   replays the prefix up to the first gap or tombstone.
+- **Checkpoints and ranged reads**: segments are stored as independently compressed 256 KiB frames
+  behind a small index. A committed extent map (block → segment and offset) is checkpointed every 64
+  segments.
+  - A restore loads the newest checkpoint, fetches only the live data with ranged GETs, then replays
+    the segments after it.
+  - After heavy overwriting it downloads what is current, not the history.
 - **Crash recovery**: `blockgw serve` is a small supervisor around a worker process.
   - If the worker dies, the kernel keeps the device and queues its I/O (`UBLK_F_USER_RECOVERY`).
     The supervisor restarts the worker at once, and the new worker re-attaches the device.
@@ -147,10 +153,10 @@ On macOS or Windows, run blockgw in a Linux VM; see [docs/local-dev.md](docs/loc
 
 - `cargo test`: unit tests for the segment format, replay and fencing rules, write-intent tracking
   and in-order commit.
-- `sudo tests/e2e/run.sh`: fifteen end-to-end cases against real ublk devices, with a local
+- `sudo tests/e2e/run.sh`: sixteen end-to-end cases against real ublk devices, with a local
   SeaweedFS or (`E2E_STORE=dir`) a local-directory store (crash recovery, supervisor restart, orphan
   timeout, graceful drain, restore, fencing, policy switch, discard, multi-disk, idle requests,
-  metrics, ...).
+  metrics, checkpoint restore, ...).
 - `sudo tests/torture/torture.py`: crash-consistency torture. Random worker kills, random upload
   failures and store copies taken at random instants; every copy must restore to an exact prefix
   of the writes, with nothing lost that `remote` acknowledged.
@@ -162,7 +168,7 @@ See [docs/testing.md](docs/testing.md).
 
 1. Lazy cold reads: fetch byte ranges of segments on demand, so a host needs only a cache rather
    than the full image.
-2. Checkpoints of the extent map, plus garbage collection and repacking of dead segments.
+2. Garbage collection and repacking of dead segments, using the checkpointed extent map.
 3. Encryption at rest (per-disk keys).
 4. Optional streaming of unflushed writes to a standby.
 5. Zero-copy ublk (Linux 6.15+); concurrent-writer and filesystem-level (fsstress) torture.

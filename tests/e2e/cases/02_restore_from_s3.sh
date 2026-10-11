@@ -10,7 +10,7 @@ umount "$W/m"                       # unmount writes too: drain after it
 drain "$cfg" "$id"
 a=$(file_hash "$(image a 0)")
 DISK_KEYS="a-d0" r=$(write_config r 1 4)
-t0=$(now_ms); start_server "$r"; log "metric: restore $(( $(now_ms) - t0 )) ms, $(last_start_log "$r" | grep -oE 'applied [0-9]+ foreign segments')"
+t0=$(now_ms); start_server "$r"; log "metric: restore $(( $(now_ms) - t0 )) ms, $(last_start_log "$r" | grep -oE 'restored from the object store.*')"
 assert_eq "$(file_hash "$(image r 0)")" "$a" "restored image"
 rid=$(cfg_ids "$r")
 remount "$rid" "$W/r"
