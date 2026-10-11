@@ -27,6 +27,33 @@
 | `lag <id> <MiB>` | change the upload lag limit for the `local` policy |
 | `drain <id>` | seal the open segment, wait until everything is committed, then write a checkpoint |
 | `gc <id>` | drain, checkpoint, then run one garbage-collection round now |
+| `attach <disk JSON>` | open a disk at runtime (needs `devices_dir`); replies once `/dev/ublkb<id>` is ready |
+| `detach <id> [purge]` | stop serving a disk attached with `attach`, after its writes are in the store; `purge` also removes its local data |
+
+## Attaching and detaching disks at runtime
+
+Set `"devices_dir": "/var/lib/blockgw/disks"` in the config. Disks can then come and go without
+restarting the service; the static `devices` list may stay empty.
+
+```sh
+blockgw ctl /run/blockgw.sock attach '{"id":12,"size_gb":20,"dir":"/var/lib/blockgw/img/12","prefix":"envs/12","policy":"local"}'
+# ... mount /dev/ublkb12, use it, unmount ...
+blockgw ctl /run/blockgw.sock detach 12          # keep the local image: a later attach is instant
+blockgw ctl /run/blockgw.sock detach 12 purge    # park: the disk lives only in the object store
+```
+
+- `attach` takes the same JSON as an entry of `devices`. It writes `<devices_dir>/<id>.json`
+  first, so a worker restart re-attaches the disk. Ids, prefixes and local dirs must differ from
+  every attached disk.
+- A disk whose local image is gone (purged, or a new host) is restored lazily: the device is
+  served at once and blocks are fetched as they are read.
+- `detach` refuses while the device is mounted or held open, in any mount namespace (it checks
+  with an exclusive open). It then waits for the upload backlog (up to 60 s; if that fails the
+  disk stays attached), stops the device, uploads anything that slipped in, writes a checkpoint,
+  deletes the device and removes the disk file.
+- Disks from the config file's `devices` cannot be detached at runtime; edit the config instead.
+- The supervisor re-reads `devices_dir`; only devices that exist count toward the orphan timeout,
+  so a disk being attached does not.
 
 ## Metrics
 

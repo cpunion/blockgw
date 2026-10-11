@@ -418,6 +418,9 @@ The torture test runs in CI with `--encrypt` as well (remote policy), and e2e ca
   - A starting worker attaches each device according to its kernel state: QUIESCED or FAIL_IO →
     recover; DEAD → delete and add; missing → add; LIVE → refuse, because another server owns it.
   - `--no-supervisor` runs the worker directly, for an external service manager.
+  - With `devices_dir`, disks are attached and detached at runtime (`ctl attach` / `detach`); each
+    is a JSON file there, so a restarted worker re-attaches the same set. The supervisor re-reads
+    the set and counts only devices that exist toward the orphan timeout.
 - **Threads**: one ublk queue thread per disk queue, plus one dispatcher thread per disk; one
   control-socket thread and 16 upload workers per process.
 - **Memory**: 15.5 MB for 16 idle disks.

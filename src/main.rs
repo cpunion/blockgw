@@ -4,6 +4,7 @@
 //!   blockgw serve CONFIG.json [--orphan-timeout SECS] [--no-supervisor]
 //!       serve every configured disk; devices left by a crashed server are re-attached, others added
 //!   blockgw ctl SOCKET <command...>          policy <id> local|remote | lag <id> <MiB> | drain <id> | stats
+//!                                            | attach <disk JSON> | detach <id> [purge]
 //!   blockgw del <ublk-id>                    stop and delete a ublk device
 //!
 //! Data path per I/O (queue thread, io_uring shared with the ublk queue):
@@ -35,12 +36,14 @@ use libublk::helpers::IoBuf;
 use libublk::io::{UblkDev, UblkQueue};
 use libublk::uring_async::ublk_submit_sqe_async;
 use libublk::{ctrl::UblkCtrl, BufDesc, UblkError, UblkFlags};
+use std::collections::HashSet;
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::io::AsRawFd;
 use std::os::unix::net::{UnixListener, UnixStream};
+use std::path::Path;
 use std::rc::Rc;
 use std::sync::atomic::Ordering::*;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 #[derive(serde::Deserialize)]
 struct Config {
@@ -51,8 +54,34 @@ struct Config {
     /// optional "host:port" for a Prometheus `GET /metrics` endpoint
     metrics_addr: Option<String>,
     control_socket: String,
+    #[serde(default)]
     devices: Vec<DevConfig>,
+    /// optional directory of `<id>.json` disk files: disks attached and detached at runtime with
+    /// `ctl attach` / `ctl detach`, re-attached when the worker restarts
+    devices_dir: Option<String>,
     upload_workers: Option<usize>,
+    /// ids of the disks that came from `devices_dir`
+    #[serde(skip)]
+    dynamic: HashSet<i32>,
+}
+
+/// What `ctl attach` needs to open a disk like the ones opened at startup.
+struct Ctx {
+    store: Arc<dyn store::Store>,
+    pool: Arc<dev::Pool>,
+    devices_dir: Option<String>,
+    dynamic: Mutex<HashSet<i32>>,
+}
+static CTX: std::sync::OnceLock<Ctx> = std::sync::OnceLock::new();
+
+/// A disk being served, with the thread that runs its ublk device.
+type Served = (Arc<Dev>, Option<std::thread::JoinHandle<()>>);
+
+/// Every disk this worker serves.
+static DISKS: Mutex<Vec<Served>> = Mutex::new(Vec::new());
+
+fn disks() -> Vec<Arc<Dev>> {
+    DISKS.lock().unwrap().iter().map(|(d, _)| d.clone()).collect()
 }
 
 const IO_BUF: u32 = 256 << 10;
@@ -83,9 +112,9 @@ fn main() -> Result<()> {
                 .transpose()
                 .context("--orphan-timeout takes seconds")?
                 .unwrap_or(30);
-            let cfg = load_config(path)?;
-            let ids: Vec<i32> = cfg.devices.iter().map(|d| d.id).collect();
-            std::process::exit(supervise::supervise(path, &ids, std::time::Duration::from_secs(timeout))?)
+            load_config(path)?;
+            let p = path.clone();
+            std::process::exit(supervise::supervise(path, std::time::Duration::from_secs(timeout), move || config_ids(&p))?)
         }
         Some("worker") => worker(args.get(2).context("missing CONFIG")?),
         Some("check-config") => {
@@ -115,24 +144,60 @@ fn main() -> Result<()> {
 }
 
 fn load_config(path: &str) -> Result<Config> {
-    let cfg: Config = serde_json::from_slice(&std::fs::read(path).with_context(|| format!("read {path}"))?).context("parse config")?;
+    let mut cfg: Config = serde_json::from_slice(&std::fs::read(path).with_context(|| format!("read {path}"))?).context("parse config")?;
     anyhow::ensure!(cfg.s3.is_some() != cfg.local_store.is_some(), "configure exactly one of \"s3\" and \"local_store\"");
-    let mut ids = std::collections::HashSet::new();
-    for d in &cfg.devices {
-        anyhow::ensure!(ids.insert(d.id), "device id {} appears twice", d.id);
-        anyhow::ensure!(d.id >= 0, "device id {} must be >= 0", d.id);
-        anyhow::ensure!(d.size_gb > 0, "device {}: size_gb must be > 0", d.id);
-        anyhow::ensure!(
-            !d.prefix.is_empty() && !d.prefix.ends_with('/'),
-            "device {}: prefix must be non-empty without a trailing '/'",
-            d.id
-        );
-        anyhow::ensure!(d.policy == "local" || d.policy == "remote", "device {}: policy must be local or remote", d.id);
-        if let Some(k) = &d.key_file {
-            crypt::load_key(k).with_context(|| format!("device {}", d.id))?;
+    if let Some(dir) = &cfg.devices_dir {
+        for d in dir_disks(dir)? {
+            cfg.dynamic.insert(d.id);
+            cfg.devices.push(d);
         }
     }
+    for (i, d) in cfg.devices.iter().enumerate() {
+        validate_dev(d)?;
+        check_distinct(d, &cfg.devices[..i])?;
+    }
     Ok(cfg)
+}
+
+/// The disk files in `devices_dir`, in name order.
+fn dir_disks(dir: &str) -> Result<Vec<DevConfig>> {
+    std::fs::create_dir_all(dir).with_context(|| format!("devices_dir {dir}"))?;
+    let mut files: Vec<_> =
+        std::fs::read_dir(dir)?.filter_map(|e| e.ok().map(|e| e.path())).filter(|p| p.extension().is_some_and(|x| x == "json")).collect();
+    files.sort();
+    files.iter().map(|f| serde_json::from_slice(&std::fs::read(f)?).with_context(|| format!("parse {}", f.display()))).collect()
+}
+
+fn validate_dev(d: &DevConfig) -> Result<()> {
+    anyhow::ensure!(d.id >= 0, "device id {} must be >= 0", d.id);
+    anyhow::ensure!(d.size_gb > 0, "device {}: size_gb must be > 0", d.id);
+    anyhow::ensure!(!d.prefix.is_empty() && !d.prefix.ends_with('/'), "device {}: prefix must be non-empty without a trailing '/'", d.id);
+    anyhow::ensure!(d.policy == "local" || d.policy == "remote", "device {}: policy must be local or remote", d.id);
+    if let Some(k) = &d.key_file {
+        crypt::load_key(k).with_context(|| format!("device {}", d.id))?;
+    }
+    Ok(())
+}
+
+/// Two disks may not share an id, an object prefix (they would write one log) or a local dir.
+fn check_distinct<'a>(d: &DevConfig, others: impl IntoIterator<Item = &'a DevConfig>) -> Result<()> {
+    for o in others {
+        anyhow::ensure!(o.id != d.id, "device id {} appears twice", d.id);
+        anyhow::ensure!(o.prefix != d.prefix, "devices {} and {} share the prefix {:?}", o.id, d.id, d.prefix);
+        anyhow::ensure!(o.dir != d.dir, "devices {} and {} share the dir {:?}", o.id, d.id, d.dir);
+    }
+    Ok(())
+}
+
+/// Ids of every disk the config names, including `devices_dir` (for the supervisor, which re-reads
+/// it as disks are attached and detached).
+fn config_ids(path: &str) -> Option<Vec<i32>> {
+    let cfg: Config = serde_json::from_slice(&std::fs::read(path).ok()?).ok()?;
+    let mut ids: Vec<i32> = cfg.devices.iter().map(|d| d.id).collect();
+    if let Some(dir) = &cfg.devices_dir {
+        ids.extend(dir_disks(dir).ok()?.iter().map(|d| d.id));
+    }
+    Some(ids)
 }
 
 /// The worker: opens every disk, re-uploads what a crashed run left behind, and serves the devices.
@@ -154,51 +219,37 @@ fn worker(path: &str) -> Result<()> {
         let f = fetch.clone();
         std::thread::Builder::new().name(format!("fetch-{i}")).spawn(move || f.worker())?;
     }
-    let mut devs = Vec::new();
+    let _ = CTX.set(Ctx { store: s3, pool, devices_dir: cfg.devices_dir.clone(), dynamic: Mutex::new(cfg.dynamic.clone()) });
     for dc in cfg.devices.clone() {
-        failpoint::hit("open")?;
-        let store: Arc<dyn store::Store> = match &dc.key_file {
-            Some(k) => Arc::new(crypt::CryptStore::new(s3.clone(), &crypt::load_key(k)?)),
-            None => s3.clone(),
-        };
-        let d = Arc::new(Dev::open(dc, store)?);
-        let (d2, p2) = (d.clone(), pool.clone());
-        std::thread::Builder::new().name(format!("disp-{}", d.cfg.id)).spawn(move || d2.dispatcher(&p2))?;
-        d.recover()?; // before attach: the crashed run's un-uploaded tail goes first
-        let d3 = d.clone();
-        std::thread::Builder::new().name(format!("ckpt-{}", d.cfg.id)).spawn(move || d3.checkpointer())?;
-        let d4 = d.clone();
-        std::thread::Builder::new().name(format!("hydrate-{}", d.cfg.id)).spawn(move || d4.hydrator())?;
-        devs.push(d);
+        start_disk(dc)?;
     }
     // one thread seals every disk's open segment once its oldest write is seal_interval_ms old
-    let seal_devs = devs.clone();
     std::thread::Builder::new().name("sealer".into()).spawn(move || loop {
         std::thread::sleep(std::time::Duration::from_millis(100));
-        for d in &seal_devs {
+        for d in disks() {
             d.seal_if_due();
         }
     })?;
-    let ctl_devs = devs.clone();
     let _ = std::fs::remove_file(&cfg.control_socket);
     let listener = UnixListener::bind(&cfg.control_socket)?;
     std::thread::spawn(move || {
         for s in listener.incoming().flatten() {
-            let _ = handle_ctl(s, &ctl_devs);
+            // one thread per request: an attach (a restore) must not hold up stats or drains
+            std::thread::spawn(move || {
+                let _ = handle_ctl(s);
+            });
         }
     });
     if let Some(addr) = &cfg.metrics_addr {
-        let mdevs = devs.clone();
-        metrics::serve(addr, move || snapshot(&mdevs)).with_context(|| format!("metrics listener on {addr}"))?;
+        metrics::serve(addr, move || snapshot(&disks())).with_context(|| format!("metrics listener on {addr}"))?;
         info!("metrics on http://{addr}/metrics");
     }
     // SIGTERM: drain every disk's upload queue, then exit; the devices stay recoverable
-    let term_devs = devs.clone();
     std::thread::Builder::new().name("term".into()).spawn(move || {
         while !supervise::term_requested() {
             std::thread::sleep(std::time::Duration::from_millis(100));
         }
-        for d in &term_devs {
+        for d in &disks() {
             let need = d.seal();
             let t0 = std::time::Instant::now();
             while d.committed.load(SeqCst) < need && !d.fenced.load(SeqCst) && t0.elapsed().as_secs() < 60 {
@@ -211,16 +262,170 @@ fn worker(path: &str) -> Result<()> {
         }
         std::process::exit(0);
     })?;
-    let mut handles = Vec::new();
-    for d in devs {
-        handles.push(std::thread::Builder::new().name(format!("ublk-{}", d.cfg.id)).spawn(move || run_disk(d))?);
-    }
-    for h in handles {
-        if let Ok(Err(e)) = h.join() {
-            error!("disk thread failed: {e:#}");
+    if cfg.devices_dir.is_some() {
+        // disks come and go: keep serving (and accepting attaches) until SIGTERM
+        loop {
+            std::thread::sleep(std::time::Duration::from_secs(3600));
         }
     }
+    // a fixed set of disks: return once every device was deleted
+    let handles: Vec<_> = DISKS.lock().unwrap().iter_mut().filter_map(|(_, h)| h.take()).collect();
+    for h in handles {
+        let _ = h.join();
+    }
     Ok(())
+}
+
+/// Open a disk, re-upload what a crashed run left behind, and start serving it.
+fn start_disk(dc: DevConfig) -> Result<Arc<Dev>> {
+    let ctx = CTX.get().expect("worker context");
+    failpoint::hit("open")?;
+    let store: Arc<dyn store::Store> = match &dc.key_file {
+        Some(k) => Arc::new(crypt::CryptStore::new(ctx.store.clone(), &crypt::load_key(k)?)),
+        None => ctx.store.clone(),
+    };
+    let d = Arc::new(Dev::open(dc, store)?);
+    let (d2, p2) = (d.clone(), ctx.pool.clone());
+    std::thread::Builder::new().name(format!("disp-{}", d.cfg.id)).spawn(move || d2.dispatcher(&p2))?;
+    if let Err(e) = d.recover() {
+        d.stop();
+        return Err(e); // before attach: the crashed run's un-uploaded tail goes first
+    }
+    let d3 = d.clone();
+    std::thread::Builder::new().name(format!("ckpt-{}", d.cfg.id)).spawn(move || d3.checkpointer())?;
+    let d4 = d.clone();
+    std::thread::Builder::new().name(format!("hydrate-{}", d.cfg.id)).spawn(move || d4.hydrator())?;
+    let d5 = d.clone();
+    let h = std::thread::Builder::new().name(format!("ublk-{}", d.cfg.id)).spawn(move || {
+        if let Err(e) = run_disk(d5) {
+            error!("disk thread failed: {e:#}");
+        }
+    })?;
+    DISKS.lock().unwrap().push((d.clone(), Some(h)));
+    Ok(d)
+}
+
+/// Write a disk file atomically and durably.
+fn write_durable(path: &Path, bytes: &[u8]) -> Result<()> {
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, bytes)?;
+    std::fs::File::open(&tmp)?.sync_all()?;
+    std::fs::rename(&tmp, path)?;
+    std::fs::File::open(path.parent().unwrap_or(Path::new(".")))?.sync_all()?;
+    Ok(())
+}
+
+/// Seal and wait until everything written so far is committed (false: timed out, or fenced).
+fn drain_for(d: &Dev, limit: std::time::Duration) -> bool {
+    let need = d.seal();
+    let t0 = std::time::Instant::now();
+    while d.committed.load(SeqCst) < need {
+        if d.fenced.load(SeqCst) || t0.elapsed() > limit {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    true
+}
+
+/// `ctl attach <disk JSON>`: open a disk at runtime and keep it attached across worker restarts.
+fn attach(json: &str) -> Result<String> {
+    let ctx = CTX.get().expect("worker context");
+    let dir = ctx.devices_dir.as_ref().context("attach needs \"devices_dir\" in the config")?;
+    let dc: DevConfig = serde_json::from_str(json).context("parse the disk JSON")?;
+    validate_dev(&dc)?;
+    let current: Vec<DevConfig> = disks().iter().map(|d| d.cfg.clone()).collect();
+    check_distinct(&dc, &current)?;
+    let id = dc.id;
+    anyhow::ensure!(supervise::device_state(id).is_none(), "ublk device {id} already exists (another server, or not deleted yet)");
+    let path = Path::new(dir).join(format!("{id}.json"));
+    write_durable(&path, json.as_bytes())?;
+    ctx.dynamic.lock().unwrap().insert(id);
+    let fail = |e: anyhow::Error| {
+        ctx.dynamic.lock().unwrap().remove(&id);
+        let _ = std::fs::remove_file(&path);
+        e
+    };
+    let d = start_disk(dc).map_err(fail)?;
+    let t0 = std::time::Instant::now();
+    loop {
+        if supervise::device_state(id) == Some(libublk::sys::UBLK_S_DEV_LIVE) {
+            return Ok(format!("ok disk {id} attached as /dev/ublkb{id} in {} ms", t0.elapsed().as_millis()));
+        }
+        let finished = DISKS.lock().unwrap().iter().any(|(x, h)| Arc::ptr_eq(x, &d) && h.as_ref().is_none_or(|h| h.is_finished()));
+        if finished {
+            d.stop();
+            DISKS.lock().unwrap().retain(|(x, _)| !Arc::ptr_eq(x, &d));
+            return Err(fail(anyhow::anyhow!("disk {id}: the device did not start (see the log)")));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
+/// Is the block device claimed (mounted, or held open with O_EXCL), in any mount namespace? An
+/// exclusive open fails with EBUSY then. The open goes through a private device node made from
+/// the number in sysfs, not /dev/ublkbN, which can be missing or stale (containers without udev).
+/// An open that fails for any other reason is an error: the check must not pass by accident.
+fn in_use(n: i32, dir: &str) -> Result<bool> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let num = std::fs::read_to_string(format!("/sys/block/ublkb{n}/dev")).with_context(|| format!("disk {n}: no block device in sysfs"))?;
+    let (maj, min) = num.trim().split_once(':').context("sysfs dev number")?;
+    let node = Path::new(dir).join(".excl-check");
+    let _ = std::fs::remove_file(&node);
+    let c = std::ffi::CString::new(node.as_os_str().as_encoded_bytes())?;
+    let dev = libc::makedev(maj.parse()?, min.parse()?);
+    if unsafe { libc::mknod(c.as_ptr(), libc::S_IFBLK | 0o600, dev) } != 0 {
+        return Err(std::io::Error::last_os_error()).with_context(|| format!("disk {n}: create a device node to check it is unused"));
+    }
+    let r = std::fs::OpenOptions::new().read(true).custom_flags(libc::O_EXCL).open(&node);
+    let _ = std::fs::remove_file(&node);
+    match r {
+        Ok(_) => Ok(false),
+        Err(e) if e.raw_os_error() == Some(libc::EBUSY) => Ok(true),
+        Err(e) => Err(e).with_context(|| format!("disk {n}: check that the device is unused")),
+    }
+}
+
+/// `ctl detach <id> [purge]`: stop serving a disk attached with `attach`, after its writes are in
+/// the object store. `purge` also removes the local image: the disk is then only in the object
+/// store, and a later attach restores it (lazily).
+fn detach(id: &str, purge: bool) -> Result<String> {
+    let ctx = CTX.get().expect("worker context");
+    let n: i32 = id.parse().context("disk id")?;
+    let d = disks().into_iter().find(|d| d.cfg.id == n).context("no such disk")?;
+    anyhow::ensure!(
+        ctx.dynamic.lock().unwrap().contains(&n),
+        "disk {n} comes from the config file's \"devices\"; only disks attached with `attach` can be detached"
+    );
+    anyhow::ensure!(!in_use(n, &d.cfg.dir)?, "disk {n} is in use (mounted or held open); unmount it first");
+    let limit = std::time::Duration::from_secs(60);
+    anyhow::ensure!(drain_for(&d, limit), "disk {n}: uploads did not drain within 60 s (or the disk is fenced); it stays attached");
+    // stop the device: nothing can write any more; then commit whatever slipped in meanwhile
+    UblkCtrl::new_simple(n)?.kill_dev()?;
+    anyhow::ensure!(
+        drain_for(&d, limit),
+        "disk {n}: stopped, but the last uploads did not drain; the next worker start recovers it from its local image"
+    );
+    if let Err(e) = d.checkpoint() {
+        warn!("disk {n}: checkpoint before detach failed: {e:#}");
+    }
+    d.stop();
+    supervise::remove_device(n);
+    let h = DISKS.lock().unwrap().iter_mut().find(|(x, _)| Arc::ptr_eq(x, &d)).and_then(|(_, h)| h.take());
+    if let Some(h) = h {
+        let _ = h.join();
+    }
+    DISKS.lock().unwrap().retain(|(x, _)| !Arc::ptr_eq(x, &d));
+    ctx.dynamic.lock().unwrap().remove(&n);
+    if let Some(dir) = &ctx.devices_dir {
+        let _ = std::fs::remove_file(Path::new(dir).join(format!("{n}.json")));
+        std::fs::File::open(dir)?.sync_all()?;
+    }
+    if purge {
+        std::fs::remove_dir_all(&d.cfg.dir).with_context(|| format!("remove {}", d.cfg.dir))?;
+    }
+    info!("disk {n}: detached{}", if purge { ", local data removed" } else { "" });
+    Ok(format!("ok disk {n} detached{}", if purge { ", local data removed" } else { "" }))
 }
 
 fn run_disk(d: Arc<Dev>) -> Result<()> {
@@ -445,13 +650,18 @@ fn rss_kb() -> u64 {
         .unwrap_or(0)
 }
 
-fn handle_ctl(s: UnixStream, devs: &[Arc<Dev>]) -> Result<()> {
+fn handle_ctl(s: UnixStream) -> Result<()> {
     let mut w = s.try_clone()?;
     let mut line = String::new();
     BufReader::new(s).read_line(&mut line)?;
     let a: Vec<&str> = line.split_whitespace().collect();
+    let devs = disks();
+    let devs = &devs[..];
     let find = |id: &str| devs.iter().find(|d| d.cfg.id.to_string() == id).cloned();
     let out = match a.as_slice() {
+        ["attach", ..] => attach(line.trim_start().trim_start_matches("attach").trim()).unwrap_or_else(|e| format!("error: {e:#}")),
+        ["detach", id] => detach(id, false).unwrap_or_else(|e| format!("error: {e:#}")),
+        ["detach", id, "purge"] => detach(id, true).unwrap_or_else(|e| format!("error: {e:#}")),
         ["policy", id, p] => match find(id) {
             Some(d) => {
                 d.policy.store(if *p == "remote" { POLICY_REMOTE } else { POLICY_LOCAL }, SeqCst);

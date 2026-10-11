@@ -210,6 +210,8 @@ pub struct Dev {
     pub policy: AtomicU8,
     pub max_lag: AtomicU64,
     pub fenced: AtomicBool,
+    /// set when the disk is detached: its background threads exit
+    stopped: AtomicBool,
     pub stats: Stats,
 }
 
@@ -339,6 +341,7 @@ impl Dev {
             committed: AtomicU64::new(0),
             policy: AtomicU8::new(policy),
             fenced: AtomicBool::new(false),
+            stopped: AtomicBool::new(false),
             stats: Stats::default(),
         })
     }
@@ -493,7 +496,7 @@ impl Dev {
         let blocks = self.size.div_ceil(crate::extmap::BLOCK);
         let chunk = 256u64; // 1 MiB of blocks per step
         let mut next = 0u64;
-        while self.cfg.hydrate_mbps > 0 && !self.fully_present.load(Acquire) && !self.fenced.load(SeqCst) {
+        while self.cfg.hydrate_mbps > 0 && !self.fully_present.load(Acquire) && !self.fenced.load(SeqCst) && !self.stopped.load(SeqCst) {
             let start = { self.lazy.lock().unwrap().p.next_absent(next, blocks) };
             let Some(b) = start.or_else(|| self.lazy.lock().unwrap().p.next_absent(0, blocks)) else { break };
             let t0 = Instant::now();
@@ -598,6 +601,13 @@ impl Dev {
         }
         o.push_discard(off, len);
         self.next_seq.load(SeqCst)
+    }
+
+    /// Stop this disk's background threads (dispatcher, checkpointer, hydrator): it was detached.
+    pub fn stop(&self) {
+        self.stopped.store(true, SeqCst);
+        let _q = self.queue.lock().unwrap();
+        self.queue_cv.notify_all();
     }
 
     /// Does a flush have to seal? Under `remote` it waits for the upload, so yes; under `local` the
@@ -817,7 +827,7 @@ impl Dev {
     pub fn checkpointer(&self) {
         loop {
             std::thread::sleep(std::time::Duration::from_millis(250));
-            if self.fenced.load(SeqCst) {
+            if self.fenced.load(SeqCst) || self.stopped.load(SeqCst) {
                 return;
             }
             let (c, last) = (self.committed.load(SeqCst), self.last_ckpt.load(SeqCst));
@@ -934,7 +944,7 @@ impl Dev {
             let (seq, raw) = {
                 let mut q = self.queue.lock().unwrap();
                 loop {
-                    if self.fenced.load(SeqCst) {
+                    if self.fenced.load(SeqCst) || self.stopped.load(SeqCst) {
                         return;
                     }
                     let committed = self.committed.load(SeqCst);
