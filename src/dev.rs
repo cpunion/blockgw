@@ -71,6 +71,19 @@ pub struct DevConfig {
     /// encrypt every object of this disk with the 32-byte key in this file (see crypt.rs)
     #[serde(default)]
     pub key_file: Option<String>,
+    /// seal the open segment once its oldest write is this old (0 = only on flush and size). Under
+    /// `local` a flush does not seal, so this batches the writes of many flushes into one PUT.
+    #[serde(default = "default_seal_interval")]
+    pub seal_interval_ms: u64,
+}
+fn default_seal_interval() -> u64 {
+    1000
+}
+
+/// Milliseconds on a monotonic clock (0 is never returned).
+fn mono_ms() -> u64 {
+    static T0: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+    T0.get_or_init(Instant::now).elapsed().as_millis() as u64 + 1
 }
 fn default_hydrate() -> u64 {
     64
@@ -169,6 +182,7 @@ pub struct Dev {
     regions: Mutex<Regions>,
     pending_recovery: Mutex<Vec<u64>>,
     open: Mutex<Builder>,
+    open_since: AtomicU64, // mono_ms() of the open segment's first append, 0 when empty
     queue: Mutex<Queue>,
     /// committed extent map; updated in commit order, together with `committed`
     cmap: Mutex<ExtentMap>,
@@ -297,6 +311,7 @@ impl Dev {
             regions: Mutex::new(Regions { t: tracker, cleared_unsynced: false, last_sync: Instant::now() }),
             pending_recovery: Mutex::new(dirty),
             open: Mutex::new(Builder::default()),
+            open_since: AtomicU64::new(0),
             queue: Mutex::new(Queue::default()),
             cmap: Mutex::new(cmap),
             store,
@@ -554,6 +569,9 @@ impl Dev {
     pub fn append_data(&self, off: u64, d: &[u8]) -> u64 {
         let mut o = self.open.lock().unwrap();
         let seq = self.next_seq.load(SeqCst);
+        if o.is_empty() {
+            self.open_since.store(mono_ms(), SeqCst);
+        }
         o.push_data(off, d);
         let full = o.data_len() >= MAX_SEG;
         drop(o);
@@ -564,8 +582,25 @@ impl Dev {
     }
     pub fn append_discard(&self, off: u64, len: u32) -> u64 {
         let mut o = self.open.lock().unwrap();
+        if o.is_empty() {
+            self.open_since.store(mono_ms(), SeqCst);
+        }
         o.push_discard(off, len);
         self.next_seq.load(SeqCst)
+    }
+
+    /// Does a flush have to seal? Under `remote` it waits for the upload, so yes; under `local` the
+    /// open segment is sealed by `seal_if_due` instead, unless that is disabled.
+    pub fn flush_seals(&self) -> bool {
+        self.policy.load(SeqCst) == POLICY_REMOTE || self.cfg.seal_interval_ms == 0
+    }
+
+    /// Seal the open segment once its oldest write is `seal_interval_ms` old (called periodically).
+    pub fn seal_if_due(&self) {
+        let since = self.open_since.load(SeqCst);
+        if self.cfg.seal_interval_ms > 0 && since != 0 && mono_ms() - since >= self.cfg.seal_interval_ms {
+            self.seal();
+        }
     }
 
     /// Close the open segment (if non-empty) and queue it. Returns the `committed` value that covers
@@ -577,6 +612,7 @@ impl Dev {
         }
         let seq = self.next_seq.fetch_add(1, SeqCst);
         let seg = std::mem::take(&mut *o);
+        self.open_since.store(0, SeqCst);
         let mut q = self.queue.lock().unwrap();
         q.bytes += seg.size() as u64;
         q.sealed.push_back(Sealed { seq, seg: Arc::new(seg) });

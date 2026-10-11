@@ -171,6 +171,14 @@ fn worker(path: &str) -> Result<()> {
         std::thread::Builder::new().name(format!("hydrate-{}", d.cfg.id)).spawn(move || d4.hydrator())?;
         devs.push(d);
     }
+    // one thread seals every disk's open segment once its oldest write is seal_interval_ms old
+    let seal_devs = devs.clone();
+    std::thread::Builder::new().name("sealer".into()).spawn(move || loop {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        for d in &seal_devs {
+            d.seal_if_due();
+        }
+    })?;
     let ctl_devs = devs.clone();
     let _ = std::fs::remove_file(&cfg.control_socket);
     let listener = UnixListener::bind(&cfg.control_socket)?;
@@ -318,7 +326,7 @@ async fn flush(d: &Dev) -> i32 {
         }
     }
     d.stats.flushes.fetch_add(1, Relaxed);
-    let need = d.seal();
+    let need = if d.flush_seals() { d.seal() } else { 0 };
     let t0 = std::time::Instant::now();
     if d.policy.load(SeqCst) == POLICY_REMOTE {
         wait_efd(|fd| d.wait_committed(need, fd)).await;

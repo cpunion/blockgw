@@ -54,16 +54,18 @@ the durable, mobile copy, and it lets each disk choose when an `fsync` must reac
 
 - **Write**: mark the region's intent bit (made durable before the first write into a clean 4 MiB
   region), write the image, then copy the data into the disk's open segment.
-- **Flush**: `fdatasync` the image, then seal the open segment, which goes to the upload pool.
-  What happens next depends on the disk's durability policy:
-  - `local`: the flush returns once the local `fdatasync` completes. Uploads lag by at most
-    `max_lag` (default 16 MiB); past that, writers wait for uploads to catch up.
-  - `remote`: the flush returns only once every segment sealed so far is in the object store.
+- **Flush**: `fdatasync` the image. What happens next depends on the disk's durability policy:
+  - `local`: the flush returns once the local `fdatasync` completes. The open segment is sealed
+    and sent to the upload pool once its oldest write is `seal_interval_ms` old (default 1 s) or
+    it reaches 16 MiB, so many flushes share one PUT. Uploads lag by at most `max_lag` (default
+    16 MiB); past that, writers wait for uploads to catch up.
+  - `remote`: the flush seals the open segment and returns only once every segment sealed so far
+    is in the object store.
 
   You can switch the policy per disk at runtime (`blockgw ctl SOCK policy <id> local|remote`).
-- **Crash-consistent object store**: segments are cut at flush boundaries and committed in sequence
-  order. Any prefix of the log is therefore a state the disk could have crashed into. A new host
-  replays the prefix up to the first gap or tombstone.
+- **Crash-consistent object store**: segments hold writes in arrival order and are committed in
+  sequence order. Any prefix of the log is therefore a state the disk could have crashed into. A
+  new host replays each epoch up to its tombstone.
 - **Checkpoints and ranged reads**: segments are stored as independently compressed 256 KiB frames
   behind a small index. A committed extent map (block → segment and offset) is checkpointed every 64
   segments.
@@ -156,7 +158,7 @@ On macOS or Windows, run blockgw in a Linux VM; see [docs/local-dev.md](docs/loc
 
 - `cargo test`: unit tests for the segment format, replay and fencing rules, write-intent tracking
   and in-order commit.
-- `sudo tests/e2e/run.sh`: twenty-one end-to-end cases against real ublk devices, with a local
+- `sudo tests/e2e/run.sh`: twenty-two end-to-end cases against real ublk devices, with a local
   SeaweedFS or (`E2E_STORE=dir`) a local-directory store (crash recovery, supervisor restart, orphan
   timeout, graceful drain, restore, fencing, policy switch, discard, multi-disk, idle requests,
   metrics, checkpoint restore, garbage collection, lazy restore, encryption, ...).
