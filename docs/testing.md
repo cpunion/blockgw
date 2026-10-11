@@ -73,6 +73,7 @@ CI runs the unit layer and the end-to-end suite on every pull request
 | `20_missing_segment` | (dir store) a committed segment in the middle of the log is deleted: a restore fails with "log incomplete" naming it instead of serving a partial disk; with the segment back, the restore works |
 | `21_lazy_crash_order` | after a lazy restore, with uploads held back by a failpoint, a write to a never-fetched block and a later write to a fetched block both survive a worker kill, and reach the store |
 | `22_local_batching` | under `local`, 300 synchronous 4 KiB writes cost a handful of PUTs (1 in practice) and reach the store within the interval without a drain; with `seal_interval_ms: 0` and under `remote` every flush seals |
+| `23_attach_detach` | with `devices_dir`: attach; detach refused while mounted; detach and re-attach reuses the local image; detach with `purge` and re-attach restores lazily from the store; a worker crash re-attaches from `devices_dir`; conflicting ids or prefixes are refused |
 
 Failpoints (`src/failpoint.rs`) let a case make the server fail at a named place:
 

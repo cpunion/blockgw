@@ -149,8 +149,11 @@ alerts and the control socket are in [docs/operations.md](docs/operations.md)):
   missing; no flag is needed.
 - **Shutdown**: `SIGTERM` drains every disk's upload queue, then exits, and leaves the devices
   recoverable by the next start.
-- **Moving a disk**: unmount it, run `drain`, stop the service, then start a server with the same
-  `prefix` on the new host. The image is restored from the object store.
+- **Disks at runtime**: with `devices_dir` in the config, `blockgw ctl SOCK attach '<disk JSON>'`
+  and `detach <id> [purge]` add and remove disks without a restart. `detach … purge` parks a disk:
+  it then lives only in the object store, and the next `attach` restores it lazily.
+- **Moving a disk**: unmount it, `detach` it (or run `drain` and stop the service), then attach a
+  disk with the same `prefix` on the new host. The image is restored from the object store.
 
 On macOS or Windows, run blockgw in a Linux VM; see [docs/local-dev.md](docs/local-dev.md).
 
@@ -158,7 +161,7 @@ On macOS or Windows, run blockgw in a Linux VM; see [docs/local-dev.md](docs/loc
 
 - `cargo test`: unit tests for the segment format, replay and fencing rules, write-intent tracking
   and in-order commit.
-- `sudo tests/e2e/run.sh`: twenty-two end-to-end cases against real ublk devices, with a local
+- `sudo tests/e2e/run.sh`: twenty-three end-to-end cases against real ublk devices, with a local
   SeaweedFS or (`E2E_STORE=dir`) a local-directory store (crash recovery, supervisor restart, orphan
   timeout, graceful drain, restore, fencing, policy switch, discard, multi-disk, idle requests,
   metrics, checkpoint restore, garbage collection, lazy restore, encryption, ...).

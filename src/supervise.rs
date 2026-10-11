@@ -88,11 +88,17 @@ pub fn remove_device(id: i32) {
 
 /// Run the worker under supervision until it exits cleanly, a termination signal arrives, or the
 /// devices stay orphaned for longer than `orphan_timeout`.
-pub fn supervise(config: &str, ids: &[i32], orphan_timeout: Duration) -> Result<i32> {
+///
+/// `ids` lists the configured disks (re-read periodically: disks can be attached at runtime). Only
+/// devices that exist count: a device that is not live has I/O waiting for a server, while a disk
+/// still being attached has no device yet.
+pub fn supervise(config: &str, orphan_timeout: Duration, ids: impl Fn() -> Option<Vec<i32>>) -> Result<i32> {
     install_term_handler();
     let exe = std::env::current_exe()?;
     let mut backoff = Duration::from_millis(200);
     let mut down_since: Option<Instant> = Some(Instant::now()); // nothing is live before the first start
+    let mut known = ids().unwrap_or_default();
+    let mut read_at = Instant::now();
     loop {
         let mut child = Command::new(&exe).arg("worker").arg(config).spawn()?;
         let started = Instant::now();
@@ -105,7 +111,11 @@ pub fn supervise(config: &str, ids: &[i32], orphan_timeout: Duration) -> Result<
             if let Some(st) = child.try_wait()? {
                 break st;
             }
-            let all_live = ids.iter().all(|id| device_state(*id) == Some(UBLK_S_DEV_LIVE));
+            if read_at.elapsed() > Duration::from_secs(1) {
+                known = ids().unwrap_or(known);
+                read_at = Instant::now();
+            }
+            let all_live = known.iter().filter_map(|id| device_state(*id)).all(|s| s == UBLK_S_DEV_LIVE);
             if all_live {
                 down_since = None;
                 backoff = Duration::from_millis(200);
@@ -126,8 +136,9 @@ pub fn supervise(config: &str, ids: &[i32], orphan_timeout: Duration) -> Result<
         }
         let since = *down_since.get_or_insert_with(Instant::now);
         if since.elapsed() > orphan_timeout {
-            crate::warn!("supervisor: orphan timeout ({orphan_timeout:?}) exceeded; failing devices {ids:?}");
-            for id in ids {
+            let known = ids().unwrap_or(known);
+            crate::warn!("supervisor: orphan timeout ({orphan_timeout:?}) exceeded; failing devices {known:?}");
+            for id in &known {
                 fail_device(*id);
             }
             return Ok(1);
