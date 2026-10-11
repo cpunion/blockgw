@@ -10,9 +10,9 @@ umount_ok "$W/m"                       # unmount writes too: drain after it
 drain "$cfg" "$id"
 a=$(file_hash "$(image a 0)")
 DISK_KEYS="a-d0" r=$(write_config r 1 4)
-t0=$(now_ms); start_server "$r"; log "metric: restore $(( $(now_ms) - t0 )) ms, $(last_start_log "$r" | grep -oE 'restored from the object store.*')"
-assert_eq "$(file_hash "$(image r 0)")" "$a" "restored image"
+t0=$(now_ms); start_server "$r"; log "metric: restore $(( $(now_ms) - t0 )) ms, $(last_start_log "$r" | grep -oE '(lazy restore|restored from the object store).*')"
+assert_eq "$(dev_hash "$(cfg_ids "$r")")" "$a" "restored image"
 rid=$(cfg_ids "$r")
-remount "$rid" "$W/r"
-assert_eq "$(tree_hash "$W/r/tree")" "$h" "restored tree"
-assert_eq "$(file_hash "$W/r/big.bin")" "$hb" "restored big file"
+remount "$rid" "$W/rm"
+assert_eq "$(tree_hash "$W/rm/tree")" "$h" "restored tree"
+assert_eq "$(file_hash "$W/rm/big.bin")" "$hb" "restored big file"

@@ -159,7 +159,7 @@ On macOS or Windows, run blockgw in a Linux VM; see [docs/local-dev.md](docs/loc
 - `sudo tests/e2e/run.sh`: seventeen end-to-end cases against real ublk devices, with a local
   SeaweedFS or (`E2E_STORE=dir`) a local-directory store (crash recovery, supervisor restart, orphan
   timeout, graceful drain, restore, fencing, policy switch, discard, multi-disk, idle requests,
-  metrics, checkpoint restore, garbage collection, ...).
+  metrics, checkpoint restore, garbage collection, lazy restore, ...).
 - `sudo tests/torture/torture.py`: crash-consistency torture. Random worker kills, random upload
   failures and store copies taken at random instants; every copy must restore to an exact prefix
   of the writes, with nothing lost that `remote` acknowledged.
@@ -169,10 +169,10 @@ See [docs/testing.md](docs/testing.md).
 
 ## Roadmap
 
-1. Lazy cold reads: fetch byte ranges of segments on demand (the format and the extent map already
-   allow it), so a host needs only a cache rather than the full image.
-2. Encryption at rest (per-disk keys, per frame).
-3. Optional streaming of unflushed writes to a standby.
+1. Encryption at rest (per-disk keys, per frame).
+2. Optional streaming of unflushed writes to a standby.
+3. Bounded local cache: evict cold, already-uploaded blocks so a host keeps only a working set
+   (lazy restore already fetches blocks on first read).
 4. Zero-copy ublk (Linux 6.15+); concurrent-writer and filesystem-level (fsstress) torture.
 5. Native macOS and Windows frontends (research: an iSCSI target for Windows' built-in initiator;
    an FSKit-served image file attached with `hdiutil` on macOS).

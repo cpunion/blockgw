@@ -27,4 +27,4 @@ if [ "${E2E_STORE:-s3}" = dir ]; then
 fi
 DISK_KEYS="a-d0" r=$(write_config r 1 2)
 start_server "$r"
-assert_eq "$(file_hash "$(image r 0)")" "$(file_hash "$(image a 0)")" "restored image after gc"
+assert_eq "$(dev_hash "$(cfg_ids "$r")")" "$(file_hash "$(image a 0)")" "restored image after gc"

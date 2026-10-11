@@ -62,6 +62,15 @@ pub struct DevConfig {
     /// live data rewritten per GC round
     #[serde(default = "default_repack_budget")]
     pub repack_budget_mb: u64,
+    /// restore lazily: attach at once and fetch blocks from the object store when first read
+    #[serde(default = "default_true")]
+    pub lazy: bool,
+    /// background hydration rate after a lazy restore (0 = only on demand)
+    #[serde(default = "default_hydrate")]
+    pub hydrate_mbps: u64,
+}
+fn default_hydrate() -> u64 {
+    64
 }
 fn default_ckpt_every() -> u64 {
     CKPT_EVERY
@@ -127,7 +136,19 @@ pub struct Stats {
     pub gc_deleted_segments: AtomicU64,
     pub gc_deleted_bytes: AtomicU64,
     pub gc_repacked_bytes: AtomicU64,
+    pub fetched_bytes: AtomicU64,
+    pub fetch_errors: AtomicU64,
 }
+
+/// Lazy-read state: which blocks the image holds, and which bitmap pages changed since the last
+/// flush persisted them.
+struct LazyState {
+    p: crate::presence::Presence,
+    dirty_pages: BTreeSet<usize>,
+    file_present: bool, // a presence file exists on disk
+}
+
+const PRESENCE_PAGE: usize = 4096; // bytes of bitmap per persisted page (32768 blocks)
 
 #[derive(serde::Serialize, serde::Deserialize, Default)]
 struct LocalState {
@@ -138,6 +159,9 @@ pub struct Dev {
     pub cfg: DevConfig,
     pub size: u64,
     pub image: File, // O_DIRECT, used by the I/O path
+    image_buf: File,
+    /// buffered handle to the same image, opened once: fetch fills, recovery and repack use it, so a
+    /// later mount over (or rename of) the image's directory cannot break them
     intent_file: File,
     regions: Mutex<Regions>,
     pending_recovery: Mutex<Vec<u64>>,
@@ -150,6 +174,10 @@ pub struct Dev {
     last_ckpt_at: Mutex<Instant>,
     /// the last two checkpoints written by this server (GC deletes against both)
     ckpts: Mutex<VecDeque<crate::gc::Checkpoint>>,
+    lazy: Mutex<LazyState>,
+    fully_present: AtomicBool,
+    presence_file: File,
+    metas: restore::MetaCache,
     queue_cv: Condvar,
     pub epoch: u64,
     next_seq: AtomicU64,
@@ -189,6 +217,9 @@ impl Dev {
         let t0 = Instant::now();
         let foreign = st.epoch == 0 || restore::has_foreign_data(s3, &plan, st.epoch)?;
         let loaded_ckpt;
+        let blocks = size.div_ceil(crate::extmap::BLOCK);
+        let presence_path = dir.join("presence");
+        let presence;
         if fresh || foreign {
             if !fresh && !dirty.is_empty() && foreign && st.epoch != 0 {
                 bail!("disk {} diverged: local writes were never uploaded and another host has written since", cfg.id);
@@ -196,22 +227,55 @@ impl Dev {
             // the image is rebuilt from the store: start from an empty (all-holes) file
             image.set_len(0)?;
             image.set_len(size)?;
-            let replay = OpenOptions::new().write(true).open(dir.join("data"))?;
-            let mut r = restore::restore_full(s3, &p, &plan, &mut cmap, &replay)?;
-            loaded_ckpt = r.ckpt.take();
-            replay.sync_all()?;
-            crate::info!(
-                "disk {}: restored from the object store in {} ms ({} MiB of live data from {}, then {} segments)",
-                cfg.id,
-                t0.elapsed().as_millis(),
-                r.live_bytes >> 20,
-                plan.ckpt.as_ref().map(|(k, _)| k.as_str()).unwrap_or("no checkpoint"),
-                r.segments
-            );
+            if cfg.lazy {
+                let (n, ck) = restore::rebuild_map(s3, &plan, &mut cmap)?;
+                loaded_ckpt = ck;
+                let mut p = crate::presence::Presence::full(blocks);
+                let mut absent = crate::presence::Presence::from_bytes(blocks, &[]);
+                for (b, c, _, _) in cmap.runs() {
+                    for x in b..b + c as u64 {
+                        absent.filled(x);
+                    }
+                }
+                // present = every block the map does not point at (holes read as zeros)
+                p = crate::presence::Presence::from_bytes(blocks, &invert(&absent.to_bytes(), &p.to_bytes()));
+                write_synced(&presence_path, &p.to_bytes())?;
+                crate::info!(
+                    "disk {}: lazy restore in {} ms (checkpoint + {n} segment metas); {} blocks to fetch on demand",
+                    cfg.id,
+                    t0.elapsed().as_millis(),
+                    p.absent()
+                );
+                presence = p;
+            } else {
+                let replay = OpenOptions::new().write(true).open(dir.join("data"))?;
+                let mut r = restore::restore_full(s3, &p, &plan, &mut cmap, &replay)?;
+                loaded_ckpt = r.ckpt.take();
+                replay.sync_all()?;
+                let _ = std::fs::remove_file(&presence_path);
+                crate::info!(
+                    "disk {}: restored from the object store in {} ms ({} MiB of live data from {}, then {} segments)",
+                    cfg.id,
+                    t0.elapsed().as_millis(),
+                    r.live_bytes >> 20,
+                    plan.ckpt.as_ref().map(|(k, _)| k.as_str()).unwrap_or("no checkpoint"),
+                    r.segments
+                );
+                presence = crate::presence::Presence::full(blocks);
+            }
         } else {
             let (n, ck) = restore::rebuild_map(s3, &plan, &mut cmap)?;
             loaded_ckpt = ck;
-            crate::info!("disk {}: extent map rebuilt in {} ms (checkpoint + {n} segment metas)", cfg.id, t0.elapsed().as_millis());
+            presence = match std::fs::read(&presence_path) {
+                Ok(b) => crate::presence::Presence::from_bytes(blocks, &b),
+                Err(_) => crate::presence::Presence::full(blocks),
+            };
+            crate::info!(
+                "disk {}: extent map rebuilt in {} ms (checkpoint + {n} segment metas); {} blocks absent",
+                cfg.id,
+                t0.elapsed().as_millis(),
+                presence.absent()
+            );
         }
         let tmp = dir.join("state.json.tmp");
         std::fs::write(&tmp, serde_json::to_vec(&LocalState { epoch })?)?;
@@ -224,6 +288,7 @@ impl Dev {
             max_lag: AtomicU64::new(cfg.max_lag_mb << 20),
             cfg,
             size,
+            image_buf: OpenOptions::new().read(true).write(true).open(dir.join("data"))?,
             image,
             intent_file,
             regions: Mutex::new(Regions { t: tracker, cleared_unsynced: false, last_sync: Instant::now() }),
@@ -236,6 +301,10 @@ impl Dev {
             last_ckpt_at: Mutex::new(Instant::now()),
             // the checkpoint this disk was opened from counts as the previous one for GC
             ckpts: Mutex::new(loaded_ckpt.into_iter().collect()),
+            fully_present: AtomicBool::new(presence.absent() == 0),
+            lazy: Mutex::new(LazyState { file_present: presence.absent() > 0, p: presence, dirty_pages: BTreeSet::new() }),
+            presence_file: OpenOptions::new().read(true).write(true).create(true).truncate(false).open(&presence_path)?,
+            metas: restore::MetaCache::default(),
             queue_cv: Condvar::new(),
             epoch,
             next_seq: AtomicU64::new(0),
@@ -244,6 +313,157 @@ impl Dev {
             fenced: AtomicBool::new(false),
             stats: Stats::default(),
         })
+    }
+
+    /// Any absent block in `[off, off + len)`?
+    pub fn has_absent(&self, off: u64, len: u64) -> bool {
+        if self.fully_present.load(Acquire) {
+            return false;
+        }
+        let bs = crate::extmap::BLOCK;
+        let l = self.lazy.lock().unwrap();
+        (off / bs..(off + len).div_ceil(bs)).any(|b| !l.p.is_present(b))
+    }
+
+    /// A write or discard to `[off, off + len)` starts / ends (lazy bookkeeping; free once complete).
+    pub fn write_begin(&self, off: u64, len: u64) {
+        if !self.fully_present.load(Acquire) {
+            let bs = crate::extmap::BLOCK;
+            self.lazy.lock().unwrap().p.write_begin(off / bs, len.div_ceil(bs));
+        }
+    }
+    pub fn write_end(&self, off: u64, len: u64, ok: bool) {
+        if self.fully_present.load(Acquire) {
+            return;
+        }
+        let bs = crate::extmap::BLOCK;
+        let (b, n) = (off / bs, len.div_ceil(bs));
+        let mut l = self.lazy.lock().unwrap();
+        l.p.write_end(b, n, ok);
+        if ok {
+            for x in b..b + n {
+                l.dirty_pages.insert((x / 8) as usize / PRESENCE_PAGE);
+            }
+        }
+        if l.p.absent() == 0 {
+            self.fully_present.store(true, Release);
+        }
+    }
+
+    /// Fetch every fillable absent block in `[b, b + n)` from the object store into the image.
+    pub fn ensure_present(&self, b: u64, n: u64) -> Result<u64> {
+        // A segment can vanish between planning and fetching: a local write supersedes the block
+        // and GC deletes the old segment. Planning again from the current map then skips it.
+        let mut tries = 0;
+        loop {
+            match self.ensure_present_once(b, n) {
+                Err(e) if tries < 3 => {
+                    tries += 1;
+                    crate::debug!("disk {}: fetch of blocks {b}+{n} failed, planning again: {e:#}", self.cfg.id);
+                }
+                r => return r,
+            }
+        }
+    }
+
+    fn ensure_present_once(&self, b: u64, n: u64) -> Result<u64> {
+        let mut want = Vec::new();
+        {
+            let mut l = self.lazy.lock().unwrap();
+            let map = self.cmap.lock().unwrap();
+            for x in b..(b + n).min(map.blocks()) {
+                if l.p.fillable(x) {
+                    match map.get(x) {
+                        Some((si, dblk)) => want.push((x, map.segs[si as usize], dblk)),
+                        None => {
+                            l.p.filled(x); // a hole: the empty image already reads zeros
+                            l.dirty_pages.insert((x / 8) as usize / PRESENCE_PAGE);
+                        }
+                    }
+                }
+            }
+        }
+        if want.is_empty() {
+            return Ok(0);
+        }
+        let got = restore::fetch_blocks(self.store.as_ref(), &self.cfg.prefix, &self.metas, &want).inspect_err(|_| {
+            self.stats.fetch_errors.fetch_add(1, Relaxed);
+        })?;
+        let img = &self.image_buf; // buffered: fetched data is not aligned
+        let mut l = self.lazy.lock().unwrap();
+        let mut bytes = 0u64;
+        for (x, data) in got {
+            if l.p.fillable(x) {
+                img.write_all_at(&data, x * crate::extmap::BLOCK)?;
+                l.p.filled(x);
+                l.dirty_pages.insert((x / 8) as usize / PRESENCE_PAGE);
+                bytes += data.len() as u64;
+            }
+        }
+        if l.p.absent() == 0 {
+            self.fully_present.store(true, Release);
+        }
+        drop(l);
+        self.stats.fetched_bytes.fetch_add(bytes, Relaxed);
+        Ok(bytes)
+    }
+
+    /// Bitmap pages to persist after the image is fdatasync'd: taken *before* the fdatasync, so
+    /// every block they mark present was in the image when the sync started.
+    pub fn presence_snapshot(&self) -> Option<Vec<(usize, Vec<u8>)>> {
+        let mut l = self.lazy.lock().unwrap();
+        if !l.file_present || l.dirty_pages.is_empty() && l.p.absent() > 0 {
+            return None;
+        }
+        let bytes = l.p.to_bytes();
+        let pages = std::mem::take(&mut l.dirty_pages)
+            .into_iter()
+            .map(|pg| {
+                let s = pg * PRESENCE_PAGE;
+                (pg, bytes[s.min(bytes.len())..(s + PRESENCE_PAGE).min(bytes.len())].to_vec())
+            })
+            .collect();
+        Some(pages)
+    }
+
+    /// Persist a snapshot after the image fdatasync. Once every block is present the file is removed.
+    pub fn presence_persist(&self, pages: Vec<(usize, Vec<u8>)>) -> Result<()> {
+        for (pg, b) in &pages {
+            self.presence_file.write_all_at(b, (pg * PRESENCE_PAGE) as u64)?;
+        }
+        self.presence_file.sync_data()?;
+        let mut l = self.lazy.lock().unwrap();
+        if l.p.absent() == 0 && l.dirty_pages.is_empty() && l.file_present {
+            l.file_present = false;
+            let _ = std::fs::remove_file(PathBuf::from(&self.cfg.dir).join("presence"));
+            crate::info!("disk {}: fully hydrated", self.cfg.id);
+        }
+        Ok(())
+    }
+
+    /// Background hydration after a lazy restore, at `hydrate_mbps`.
+    pub fn hydrator(&self) {
+        let blocks = self.size.div_ceil(crate::extmap::BLOCK);
+        let chunk = 256u64; // 1 MiB of blocks per step
+        let mut next = 0u64;
+        while self.cfg.hydrate_mbps > 0 && !self.fully_present.load(Acquire) && !self.fenced.load(SeqCst) {
+            let start = { self.lazy.lock().unwrap().p.next_absent(next, blocks) };
+            let Some(b) = start.or_else(|| self.lazy.lock().unwrap().p.next_absent(0, blocks)) else { break };
+            let t0 = Instant::now();
+            match self.ensure_present(b, chunk.min(blocks - b)) {
+                Ok(bytes) => {
+                    next = b + chunk;
+                    let budget = std::time::Duration::from_secs_f64(bytes as f64 / (self.cfg.hydrate_mbps as f64 * 1048576.0));
+                    if let Some(rest) = budget.checked_sub(t0.elapsed()) {
+                        std::thread::sleep(rest);
+                    }
+                }
+                Err(e) => {
+                    crate::warn!("disk {}: hydration fetch failed (will retry): {e:#}", self.cfg.id);
+                    std::thread::sleep(std::time::Duration::from_secs(1));
+                }
+            }
+        }
     }
 
     pub fn snapshot(&self) -> crate::metrics::DiskSnapshot {
@@ -269,11 +489,10 @@ impl Dev {
             gc_deleted_segments: s.gc_deleted_segments.load(Relaxed),
             gc_deleted_bytes: s.gc_deleted_bytes.load(Relaxed),
             gc_repacked_bytes: s.gc_repacked_bytes.load(Relaxed),
+            absent_blocks: self.lazy.lock().unwrap().p.absent(),
+            fetched_bytes: s.fetched_bytes.load(Relaxed),
+            fetch_errors: s.fetch_errors.load(Relaxed),
         }
-    }
-
-    fn image_path(&self) -> PathBuf {
-        PathBuf::from(&self.cfg.dir).join("data")
     }
 
     /// Mark regions dirty before a write proceeds; only the first write into a clean region pays an
@@ -358,16 +577,33 @@ impl Dev {
             return Ok(());
         }
         let t0 = Instant::now();
-        let rd = File::open(self.image_path())?; // buffered: no O_DIRECT alignment rules
+        let rd = &self.image_buf; // buffered: no O_DIRECT alignment rules
         let fd = rd.as_raw_fd();
         let (mut data_bytes, mut holes) = (0u64, 0u64);
         let mut buf = vec![0u8; 1 << 20];
         let mut o = self.open.lock().unwrap();
         let seq = self.next_seq.load(SeqCst); // the open segment is empty: the device is not attached yet
         let mut ranges = Vec::with_capacity(regions.len());
+        let lazy = !self.fully_present.load(Acquire);
         for r in &regions {
             let (start, end) = (r * REGION, ((r + 1) * REGION).min(self.size));
             ranges.push(self.intent_begin(start, end - start)?);
+            if lazy {
+                // after a lazy restore an absent block's data lives only in the object store: never
+                // treat it as a hole; re-upload just the present blocks (zeros included)
+                let bs = crate::extmap::BLOCK;
+                let present: Vec<u64> = {
+                    let l = self.lazy.lock().unwrap();
+                    (start / bs..end.div_ceil(bs)).filter(|b| l.p.is_present(*b)).collect()
+                };
+                let mut blk = vec![0u8; bs as usize];
+                for b in present {
+                    rd.read_exact_at(&mut blk, b * bs)?;
+                    o.push_data(b * bs, &blk);
+                    data_bytes += bs;
+                }
+                continue;
+            }
             let mut pos = start;
             while pos < end {
                 let d = unsafe { libc::lseek(fd, pos as i64, libc::SEEK_DATA) };
@@ -555,9 +791,16 @@ impl Dev {
         if victims.is_empty() {
             return Ok(0);
         }
-        let rd = File::open(self.image_path())?;
+        let rd = &self.image_buf;
         let mut bytes = 0u64;
         let mut buf = Vec::new();
+        let runs: Vec<(u64, u32)> = if self.fully_present.load(Acquire) {
+            runs
+        } else {
+            // copy only what the image holds; absent runs stay in their segment for now
+            let l = self.lazy.lock().unwrap();
+            runs.into_iter().filter(|(b, n)| (*b..*b + *n as u64).all(|x| l.p.is_present(x))).collect()
+        };
         for (b, n) in runs {
             let (off, len) = (b * crate::extmap::BLOCK, n as u64 * crate::extmap::BLOCK);
             let mut o = self.open.lock().unwrap();
@@ -660,6 +903,55 @@ fn claim_epoch(s3: &dyn Store, p: &str) -> Result<u64> {
             }
         }
         return Ok(last + 1);
+    }
+}
+
+/// Bits set in `full` and not in `sub` (both little-endian u64 bitmaps of equal length).
+fn invert(sub: &[u8], full: &[u8]) -> Vec<u8> {
+    full.iter().zip(sub).map(|(f, s)| f & !s).collect()
+}
+
+fn write_synced(path: &std::path::Path, bytes: &[u8]) -> Result<()> {
+    let f = OpenOptions::new().write(true).create(true).truncate(true).open(path)?;
+    f.write_all_at(bytes, 0)?;
+    f.sync_all()?;
+    Ok(())
+}
+
+/// Fetch jobs from read requests that touch absent blocks (served off the ublk queue threads).
+/// (disk, offset, length, eventfd to signal, failure flag)
+type FetchJob = (Arc<Dev>, u64, u64, RawFd, Arc<AtomicU64>);
+
+pub struct FetchPool {
+    jobs: Mutex<VecDeque<FetchJob>>,
+    cv: Condvar,
+}
+
+impl FetchPool {
+    pub fn new() -> Arc<FetchPool> {
+        Arc::new(FetchPool { jobs: Mutex::new(VecDeque::new()), cv: Condvar::new() })
+    }
+    /// Queue a fetch of `[off, off + len)`; `efd` is signalled when done, `failed` set to 1 on error.
+    pub fn submit(&self, d: Arc<Dev>, off: u64, len: u64, efd: RawFd, failed: Arc<AtomicU64>) {
+        self.jobs.lock().unwrap().push_back((d, off, len, efd, failed));
+        self.cv.notify_one();
+    }
+    pub fn worker(&self) {
+        loop {
+            let (d, off, len, efd, failed) = {
+                let mut j = self.jobs.lock().unwrap();
+                while j.is_empty() {
+                    j = self.cv.wait(j).unwrap();
+                }
+                j.pop_front().unwrap()
+            };
+            let bs = crate::extmap::BLOCK;
+            if let Err(e) = d.ensure_present(off / bs, (off + len).div_ceil(bs) - off / bs) {
+                crate::warn!("disk {}: on-demand fetch failed: {e:#}", d.cfg.id);
+                failed.store(1, SeqCst);
+            }
+            signal(efd);
+        }
     }
 }
 
