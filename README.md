@@ -1,5 +1,9 @@
 # blockgw
 
+[![CI](https://github.com/dastai/blockgw/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/dastai/blockgw/actions/workflows/ci.yml)
+[![codecov](https://codecov.io/gh/dastai/blockgw/graph/badge.svg)](https://codecov.io/gh/dastai/blockgw)
+[![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
+
 Virtual block devices for Linux that run at local-disk speed and persist to S3-compatible object
 storage.
 

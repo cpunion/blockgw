@@ -5,41 +5,79 @@ on:
     branches: [main]
   pull_request:
 
+permissions:
+  contents: read
+  id-token: write # Codecov OIDC upload
+
+env:
+  CARGO_TERM_COLOR: always
+
 jobs:
   check:
     name: fmt, clippy, unit tests
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Install build dependencies
         run: sudo apt-get update -qq && sudo apt-get install -y -qq clang libclang-dev
       - uses: dtolnay/rust-toolchain@stable
         with:
-          components: rustfmt, clippy
+          components: rustfmt, clippy, llvm-tools-preview
       - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@cargo-llvm-cov
       - run: cargo fmt --check
       - run: cargo clippy --all-targets -- -D warnings
-      - run: cargo test
+      - name: Unit tests with coverage
+        run: cargo llvm-cov --lcov --output-path unit.lcov
+      - uses: codecov/codecov-action@v5
+        with:
+          files: unit.lcov
+          flags: unit
+          use_oidc: true
+          fail_ci_if_error: false
 
   e2e:
     name: end-to-end (ublk + SeaweedFS)
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Install dependencies and load ublk
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq clang libclang-dev xfsprogs bc "linux-modules-extra-$(uname -r)" || \
-            sudo apt-get install -y -qq clang libclang-dev xfsprogs bc
+          sudo apt-get install -y -qq clang libclang-dev xfsprogs bc "linux-modules-extra-$(uname -r)"
           sudo modprobe ublk_drv
           ls -l /dev/ublk-control
           uname -r
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
       - uses: Swatinem/rust-cache@v2
-      - run: cargo build --release
-      - name: End-to-end suite
-        run: sudo -E env "PATH=$PATH" tests/e2e/run.sh
+      - uses: taiki-e/install-action@cargo-llvm-cov
+      - name: Build an instrumented binary
+        run: |
+          cargo llvm-cov show-env --export-prefix > llvm-cov.env
+          source llvm-cov.env
+          cargo llvm-cov clean --workspace
+          cargo build --release
+      - name: End-to-end suite (instrumented)
+        run: |
+          source llvm-cov.env
+          sudo -E env "PATH=$PATH" tests/e2e/run.sh
+      - name: End-to-end coverage report
+        if: always()
+        run: |
+          source llvm-cov.env
+          sudo chown -R "$(id -u):$(id -g)" target
+          cargo llvm-cov report --release --lcov --output-path e2e.lcov
+          cargo llvm-cov report --release --summary-only
+      - uses: codecov/codecov-action@v5
+        if: always()
+        with:
+          files: e2e.lcov
+          flags: e2e
+          use_oidc: true
+          fail_ci_if_error: false
       - name: Upload logs on failure
         if: failure()
         uses: actions/upload-artifact@v4

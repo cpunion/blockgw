@@ -11,6 +11,14 @@ There are three layers:
 CI runs the unit layer and the end-to-end suite on every pull request
 (`.github/workflows/ci.yml`).
 
+- Coverage is measured for both layers with `cargo llvm-cov`. The end-to-end suite runs an
+  instrumented release binary; servers that exit normally (when their devices are deleted) write
+  their profiles.
+- Both layers are uploaded to [Codecov](https://codecov.io/gh/dastai/blockgw) with the flags
+  `unit` and `e2e`.
+- Servers killed with `kill -9` in the crash cases write no profile, so recovery code is counted
+  through the server that takes over.
+
 ## Unit tests
 
 | Module | Tests cover |
