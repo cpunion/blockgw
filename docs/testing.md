@@ -116,7 +116,9 @@ example inside a `rust` container.
 - **Faults injected meanwhile**:
   - the worker is `SIGKILL`ed every 0.5–2 s; the supervisor restarts it;
   - 10% of uploads fail (`upload=error%10`) and are retried;
-  - every 1–3 s the store directory is copied. Objects are only created (immutable) or deleted by
+  - every 1–3 s the store directory is copied (with hard links: objects are immutable). A long run
+    keeps a uniform sample of at most `--max-copies` (default 30) of them, so disk use does not grow
+    with the duration; each is deleted once checked. Objects are only created (immutable) or deleted by
     GC, so the copy lists the checkpoints first, then copies the segments (skipping any GC deletes
     meanwhile), then only the checkpoints it listed. GC deletes checkpoints before segments, so if
     the newest listed checkpoint still exists afterwards, nothing the copy needs was deleted;

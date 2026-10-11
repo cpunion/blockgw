@@ -22,7 +22,7 @@ Usage: sudo tests/torture/fstorture.py --blockgw target/release/blockgw [--polic
 import argparse, hashlib, os, random, shutil, signal, subprocess, sys, threading, time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from torture import Server, copy_store, delete_device, dev_node, log, write_config  # noqa: E402
+from torture import CopyKeeper, Server, copy_store, delete_device, dev_node, log, write_config  # noqa: E402
 
 
 def sh(*cmd, check=True):
@@ -56,6 +56,7 @@ def main():
     ap.add_argument("--work", default="/tmp/blockgw-fstorture")
     ap.add_argument("--upload-error-pct", type=int, default=10)
     ap.add_argument("--encrypt", action="store_true")
+    ap.add_argument("--max-copies", type=int, default=30, help="store copies kept and checked (a uniform sample)")
     a = ap.parse_args()
     blockgw = os.path.abspath(a.blockgw)
     rng = random.Random(a.seed)
@@ -83,7 +84,8 @@ def main():
 
         # path -> list of events (t_start, t_end, kind, digest); kind "durable" carries the digest
         events, elock = {}, threading.Lock()
-        snaps, stop, kills, ops = [], threading.Event(), [0], [0]
+        keeper = CopyKeeper(a.max_copies, random.Random(a.seed + 1))
+        stop, kills, ops = threading.Event(), [0], [0]
 
         def note(path, t0, t1, kind, digest=None):
             with elock:
@@ -104,19 +106,27 @@ def main():
                 t0 = time.monotonic()
                 dst = os.path.join(work, f"snap{n}")
                 copy_store(store, dst)
-                snaps.append((dst, t0, time.monotonic()))
+                keeper.offer(dst, (t0, time.monotonic()))
                 n += 1
 
         t_end = time.time() + a.seconds
 
+        budget = (600 << 20) // a.threads  # live bytes per worker: the filesystem is 1 GiB
+
         def worker(i):
+            try:
+                work_loop(i)
+            except Exception as e:  # a crashed worker must fail the run, not end it quietly
+                failures.append(f"worker {i}: {e!r}")
+
+        def work_loop(i):
             wr = random.Random(a.seed * 1000 + i)
             base = os.path.join(mnt, f"w{i}")
             os.makedirs(base)
-            live = []
+            live, size = [], {}
             n = 0
             while time.time() < t_end:
-                op = wr.random()
+                op = wr.random() if sum(size.values()) < budget else 0.99  # over budget: delete
                 t0 = time.monotonic()
                 if op < 0.35 or not live:  # create (sometimes in a new subdirectory), maybe fsync
                     d = os.path.join(base, f"d{wr.randrange(8)}")
@@ -137,16 +147,20 @@ def main():
                         os.close(fd)
                         note(p, t0, time.monotonic(), "write")
                     live.append(p)
+                    size[p] = len(data)
                 elif op < 0.55:  # overwrite a range
                     p = wr.choice(live)
                     note(p, t0, t0, "write")
                     with open(p, "r+b") as f:
-                        f.seek(wr.randrange(200_000))
-                        f.write(content(wr.random(), wr.randrange(1, 20_000)))
+                        at, chunk = wr.randrange(200_000), content(wr.random(), wr.randrange(1, 20_000))
+                        f.seek(at)
+                        f.write(chunk)
+                    size[p] = max(size[p], at + len(chunk))
                 elif op < 0.65:  # truncate
                     p = wr.choice(live)
                     note(p, t0, t0, "write")
-                    os.truncate(p, wr.randrange(100_000))
+                    size[p] = wr.randrange(100_000)
+                    os.truncate(p, size[p])
                 elif op < 0.80:  # rename within the worker's tree
                     p = wr.choice(live)
                     q = os.path.join(base, f"d{wr.randrange(8)}", f"r{n}")
@@ -156,10 +170,12 @@ def main():
                     note(q, t0, t0, "write")
                     os.rename(p, q)
                     live[live.index(p)] = q
+                    size[q] = size.pop(p)
                 else:  # unlink
                     p = live.pop(wr.randrange(len(live)))
                     note(p, t0, t0, "gone")
                     os.unlink(p)
+                    del size[p]
                 ops[0] += 1
 
         wts = [threading.Thread(target=worker, args=(i,)) for i in range(a.threads)]
@@ -171,7 +187,8 @@ def main():
         stop.set()
         for t in aux:
             t.join()
-        log(f"{ops[0]} file operations, {kills[0]} worker kills, {len(snaps)} store copies")
+        snaps = [(d, c0, c1) for d, (c0, c1) in keeper.copies()]
+        log(f"{ops[0]} file operations, {kills[0]} worker kills, {keeper.n} store copies ({len(snaps)} checked)")
 
         # 1. the live filesystem
         sh("umount", mnt)
@@ -233,6 +250,9 @@ def main():
                     mounts.remove(rmnt)
                 delete_device(blockgw, rid)
                 rs.proc.wait(timeout=30)
+                if not any(f.startswith(f"copy {k}:") for f in failures):
+                    shutil.rmtree(os.path.join(work, f"rimg{k}"), ignore_errors=True)
+                    shutil.rmtree(snap, ignore_errors=True)
     finally:
         for m in mounts:
             subprocess.run(["umount", "-l", m])

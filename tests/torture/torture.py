@@ -26,7 +26,7 @@ Checks:
 Usage: sudo tests/torture/torture.py --blockgw target/release/blockgw [--policy local|remote]
                                      [--threads 1] [--encrypt] [--seconds 60] [--seed N] [--id 1500] [--work /tmp/blockgw-torture]
 """
-import argparse, json, mmap, os, random, shutil, signal, struct, subprocess, sys, threading, time, zlib
+import argparse, errno, json, mmap, os, random, shutil, signal, struct, subprocess, sys, threading, time, zlib
 
 BS = 4096
 NBLOCKS = 16384  # 64 MiB working set at the start of a 1 GiB disk
@@ -76,6 +76,30 @@ class Server:
         return int(out[0]) if out else None
 
 
+class CopyKeeper:
+    """At most `cap` store copies, a uniform sample of all those taken (reservoir sampling), so a
+    long run neither fills the disk nor keeps only its first minutes."""
+
+    def __init__(self, cap, rng):
+        self.cap, self.rng, self.n, self.items = cap, rng, 0, []  # items: (take order, dir, info)
+
+    def offer(self, path, info):
+        self.n += 1
+        if len(self.items) < self.cap:
+            self.items.append((self.n, path, info))
+            return
+        j = self.rng.randrange(self.n)
+        if j < self.cap:
+            shutil.rmtree(self.items[j][1], ignore_errors=True)
+            self.items[j] = (self.n, path, info)
+        else:
+            shutil.rmtree(path, ignore_errors=True)
+
+    def copies(self):
+        """(dir, info) in the order they were taken."""
+        return [(p, i) for _, p, i in sorted(self.items)]
+
+
 def dev_node(dev_id, timeout=10):
     """/dev/ublkbN, waiting for udev; without udev (e.g. a container's private /dev) create it."""
     path, t0 = f"/dev/ublkb{dev_id}", time.time()
@@ -108,9 +132,16 @@ def copy_store(src, dst):
         rel = os.path.relpath(path, src)
         os.makedirs(os.path.join(dst, os.path.dirname(rel)), exist_ok=True)
         try:
-            shutil.copyfile(path, os.path.join(dst, rel))
+            os.link(path, os.path.join(dst, rel))  # objects are immutable: a link is a copy
         except FileNotFoundError:
             pass  # deleted by GC after the listing
+        except OSError as e:
+            if e.errno != errno.EXDEV:
+                raise
+            try:
+                shutil.copyfile(path, os.path.join(dst, rel))
+            except FileNotFoundError:
+                pass
 
     for _ in range(20):
         ckpts = [p for p in files(src) if "/ckpt/" in p]
@@ -153,6 +184,7 @@ def main():
     ap.add_argument("--upload-error-pct", type=int, default=10)
     ap.add_argument("--encrypt", action="store_true", help="encrypt the disk (key_file)")
     ap.add_argument("--threads", type=int, default=1, help="concurrent writer threads")
+    ap.add_argument("--max-copies", type=int, default=30, help="store copies kept and checked (a uniform sample)")
     a = ap.parse_args()
     blockgw = os.path.abspath(a.blockgw)
     rng = random.Random(a.seed)
@@ -178,7 +210,7 @@ def main():
         writes = []           # index gid-1: [block, t_issue, t_done]
         wlock = threading.Lock()
         state = {"cut": 0.0}  # writes done before this instant are covered by a completed fsync
-        snaps = []            # (dir, cut when the copy started)
+        keeper = CopyKeeper(a.max_copies, random.Random(a.seed + 1))  # (dir, cut when the copy started)
         stop = threading.Event()
         kills = [0]
 
@@ -197,7 +229,7 @@ def main():
                 cut = state["cut"]
                 dst = os.path.join(work, f"snap{n}")
                 copy_store(store, dst)
-                snaps.append((dst, cut))
+                keeper.offer(dst, cut)
                 n += 1
 
         threads = [threading.Thread(target=killer, daemon=True), threading.Thread(target=snapshotter, daemon=True)]
@@ -234,7 +266,8 @@ def main():
         stop.set()
         for t in threads:
             t.join()
-        log(f"{len(writes)} writes, {kills[0]} worker kills, {len(snaps)} store copies")
+        snaps = keeper.copies()
+        log(f"{len(writes)} writes, {kills[0]} worker kills, {keeper.n} store copies ({len(snaps)} checked)")
 
         # 1. the device holds the last version of every block
         last = {}
@@ -300,6 +333,9 @@ def main():
             finally:
                 delete_device(blockgw, rid)
                 r.proc.wait(timeout=30)
+                if not any(f.startswith(f"copy {k}:") for f in failures):
+                    shutil.rmtree(rimg, ignore_errors=True)  # keep only what a failure needs
+                    shutil.rmtree(snap, ignore_errors=True)
     finally:
         for i in used_ids:
             delete_device(blockgw, i)
