@@ -71,6 +71,9 @@ pub struct DevConfig {
     /// encrypt every object of this disk with the 32-byte key in this file (see crypt.rs)
     #[serde(default)]
     pub key_file: Option<String>,
+    /// earlier keys of this disk, used only to read objects sealed before a rotation (`ctl rekey`)
+    #[serde(default)]
+    pub old_key_files: Vec<String>,
     /// also checkpoint after this much data was uploaded since the last checkpoint
     #[serde(default = "default_ckpt_mb")]
     pub checkpoint_mb: u64,
@@ -236,6 +239,7 @@ impl Dev {
         let st: LocalState = std::fs::read(dir.join("state.json")).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
         let p = cfg.prefix.clone();
 
+        probe_readable(s3, &p).with_context(|| format!("disk {}: cannot read its log (nothing was changed)", cfg.id))?;
         let epoch = claim_epoch(s3, &p)?;
 
         // Rebuild from the object store: the newest checkpoint, then the segments after it.
@@ -911,9 +915,6 @@ impl Dev {
         if victims.is_empty() {
             return Ok(0);
         }
-        let rd = &self.image_buf;
-        let mut bytes = 0u64;
-        let mut buf = Vec::new();
         let runs: Vec<(u64, u32)> = if self.fully_present.load(Acquire) {
             runs
         } else {
@@ -921,21 +922,115 @@ impl Dev {
             let l = self.lazy.lock().unwrap();
             runs.into_iter().filter(|(b, n)| (*b..*b + *n as u64).all(|x| l.p.is_present(x))).collect()
         };
-        for (b, n) in runs {
+        let bytes = self.copy_runs(&runs)?;
+        self.stats.gc_repacked_bytes.fetch_add(bytes, Relaxed);
+        Ok(bytes)
+    }
+
+    /// Copy runs `(block, count)` from the local image into the open segment (under its lock, so no
+    /// write can append between reading a block and appending its copy), then seal.
+    fn copy_runs(&self, runs: &[(u64, u32)]) -> Result<u64> {
+        let rd = &self.image_buf;
+        let mut bytes = 0u64;
+        let mut buf = Vec::new();
+        for &(b, n) in runs {
             let (off, len) = (b * crate::extmap::BLOCK, n as u64 * crate::extmap::BLOCK);
             let mut o = self.open.lock().unwrap();
             let range = self.intent_begin(off, len)?;
             buf.resize(len as usize, 0);
             rd.read_exact_at(&mut buf, off)?;
+            if o.is_empty() {
+                self.open_since.store(mono_ms(), SeqCst);
+            }
             o.push_data(off, &buf);
             let seq = self.next_seq.load(SeqCst);
+            let full = o.data_len() >= MAX_SEG;
             drop(o);
             self.intent_end(range, Some(seq));
             bytes += len;
+            if full {
+                self.seal();
+            }
         }
         self.seal();
-        self.stats.gc_repacked_bytes.fetch_add(bytes, Relaxed);
         Ok(bytes)
+    }
+
+    /// Seal and wait until everything so far is committed.
+    fn drain_all(&self) -> Result<()> {
+        let need = self.seal();
+        let mut q = self.queue.lock().unwrap();
+        while self.committed.load(SeqCst) < need {
+            anyhow::ensure!(!self.fenced.load(SeqCst), "disk {} is fenced", self.cfg.id);
+            q = self.queue_cv.wait_timeout(q, std::time::Duration::from_millis(100)).unwrap().0;
+        }
+        Ok(())
+    }
+
+    /// After a key rotation (the disk opened with a new `key_file` and the old key in
+    /// `old_key_files`), rewrite every live block still held by a segment of an earlier epoch,
+    /// which may be sealed with an old key, then checkpoint twice so GC deletes those segments and
+    /// the old checkpoints. Finally list what is left and check it opens with the current key.
+    /// Tombstones and epoch markers are never read, so they may keep an old key.
+    pub fn rekey(&self) -> Result<String> {
+        let t0 = Instant::now();
+        let bs = crate::extmap::BLOCK;
+        let blocks = self.size.div_ceil(bs);
+        let mut b = 0;
+        while !self.fully_present.load(Acquire) && b < blocks {
+            self.ensure_present(b, 256.min(blocks - b))?; // every block local, so it can be copied
+            b += 256;
+        }
+        let mut rewritten = 0u64;
+        loop {
+            let runs: Vec<(u64, u32)> = {
+                let map = self.cmap.lock().unwrap();
+                let mut take = 0u64;
+                map.runs()
+                    .into_iter()
+                    .filter(|(_, _, si, _)| map.segs[*si as usize].0 < self.epoch)
+                    .take_while(|(_, n, _, _)| {
+                        take += *n as u64 * bs;
+                        take <= 64 << 20 || take == *n as u64 * bs
+                    })
+                    .map(|(b, n, _, _)| (b, n))
+                    .collect()
+            };
+            if runs.is_empty() {
+                break;
+            }
+            rewritten += self.copy_runs(&runs)?;
+            self.drain_all()?;
+        }
+        for _ in 0..2 {
+            self.drain_all()?;
+            if !self.checkpoint()? {
+                // nothing new to checkpoint: commit a copy of one run so the position advances
+                let first = { self.cmap.lock().unwrap().runs().into_iter().next().map(|(b, n, _, _)| (b, n.min(1))) };
+                if let Some(r) = first {
+                    self.copy_runs(&[r])?;
+                    self.drain_all()?;
+                    self.checkpoint()?;
+                }
+            }
+            self.gc_round()?;
+        }
+        let p = &self.cfg.prefix;
+        let mut stale = Vec::new();
+        let segs = self.store.list_sized(&format!("{p}/seg/"))?;
+        let objs =
+            segs.into_iter().filter(|(_, s)| *s as usize != log::TOMB.len()).map(|(k, _)| k).chain(self.store.list(&format!("{p}/ckpt/"))?);
+        for k in objs {
+            if self.store.needs_old_key(&k)? {
+                stale.push(k);
+            }
+        }
+        let head = format!("disk {}: rewrote {} MiB in {} ms", self.cfg.id, rewritten >> 20, t0.elapsed().as_millis());
+        Ok(if stale.is_empty() {
+            format!("ok {head}; no segment or checkpoint needs an old key any more")
+        } else {
+            format!("ok {head}; {} objects still need an old key (e.g. {}); run rekey again", stale.len(), stale[0])
+        })
     }
 
     /// Hands sealed segments to the shared pool in seq order, at most WINDOW beyond the committed prefix.
@@ -1019,6 +1114,31 @@ fn claim_epoch(s3: &dyn Store, p: &str) -> Result<u64> {
         }
         return Ok(last + 1);
     }
+}
+
+/// Before claiming an epoch (which fences whoever serves the disk now), check that this server can
+/// read the log at all: the newest checkpoint, or else the newest segment. A wrong or missing key
+/// must fail here, not after the live writer was fenced out by a server that cannot open the disk.
+fn probe_readable(s3: &dyn Store, p: &str) -> Result<()> {
+    let newest_ckpt = s3.list(&format!("{p}/ckpt/"))?.into_iter().filter(|k| log::parse_ckpt_key(k).is_some()).max();
+    let probe = match newest_ckpt {
+        Some(k) => Some(k),
+        None => s3
+            .list_sized(&format!("{p}/seg/"))?
+            .into_iter()
+            .filter(|(k, size)| *size as usize != log::TOMB.len() && log::parse_seg_key(k).is_some())
+            .map(|(k, _)| k)
+            .max(),
+    };
+    if let Some(k) = probe {
+        let head = s3.get_range(&k, 0, 64).with_context(|| k.clone())?;
+        if k.contains("/seg/") {
+            segment::meta_end(&head).with_context(|| k.clone())?;
+        } else {
+            anyhow::ensure!(!crate::crypt::looks_encrypted(&head), "{k}: the checkpoint is encrypted, but this disk has no key_file");
+        }
+    }
+    Ok(())
 }
 
 /// Fence every unsealed epoch up to `last`, oldest first, so that afterwards every epoch below the

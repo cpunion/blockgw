@@ -28,6 +28,10 @@ pub trait Store: Send + Sync {
     fn list_sized(&self, prefix: &str) -> Result<Vec<(String, u64)>>;
     /// Delete `key`; deleting a missing key is not an error.
     fn delete(&self, key: &str) -> Result<()>;
+    /// Can `key` only be read with an old (decrypt-only) key? (encrypted stores; see `crypt`)
+    fn needs_old_key(&self, _key: &str) -> Result<bool> {
+        Ok(false)
+    }
 }
 
 /// Objects as files under a root directory (key `a/b/c` is file `<root>/a/b/c`). Useful for local

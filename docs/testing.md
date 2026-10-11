@@ -74,6 +74,7 @@ CI runs the unit layer and the end-to-end suite on every pull request
 | `21_lazy_crash_order` | after a lazy restore, with uploads held back by a failpoint, a write to a never-fetched block and a later write to a fetched block both survive a worker kill, and reach the store |
 | `22_local_batching` | under `local`, 300 synchronous 4 KiB writes cost a handful of PUTs (1 in practice) and reach the store within the interval without a drain; with `seal_interval_ms: 0` and under `remote` every flush seals |
 | `23_attach_detach` | with `devices_dir`: attach; detach refused while mounted; detach and re-attach reuses the local image; detach with `purge` and re-attach restores lazily from the store; a worker crash re-attaches from `devices_dir`; conflicting ids or prefixes are refused |
+| `24_key_rotation` | a disk written under key A opens with key B plus A as an old key; B alone cannot open it, and that failed open does not fence the live writer; `rekey` rewrites the old data; B alone then restores the whole device on a fresh host |
 
 Failpoints (`src/failpoint.rs`) let a case make the server fail at a named place:
 

@@ -28,6 +28,7 @@
 | `drain <id>` | seal the open segment, wait until everything is committed, then write a checkpoint |
 | `gc <id>` | drain, checkpoint, then run one garbage-collection round now |
 | `attach <disk JSON>` | open a disk at runtime (needs `devices_dir`); replies once `/dev/ublkb<id>` is ready |
+| `rekey <id>` | after a key rotation, rewrite everything still sealed with an old key; reports when none is left |
 | `detach <id> [purge]` | stop serving a disk attached with `attach`, after its writes are in the store; `purge` also removes its local data |
 
 ## Attaching and detaching disks at runtime
@@ -110,6 +111,7 @@ Suggested alerts:
 | `lazy` | `true` | on restore, serve the device at once and fetch blocks on first read |
 | `hydrate_mbps` | 64 | background hydration rate after a lazy restore (0 = on demand only) |
 | `key_file` | none | encrypt every object of the disk with the 32-byte key in this file |
+| `old_key_files` | `[]` | earlier keys, used only to read objects sealed before a rotation |
 | `depth`, `queues` | 32, 1 | ublk queue depth and number of queues |
 
 ## Encryption keys
@@ -127,6 +129,10 @@ head -c 32 /dev/urandom > /etc/blockgw/keys/d0.key   # or 64 hex digits
 - Keep a copy of the key outside the host (a secrets manager). Without it the disk cannot be
   restored anywhere.
 - One key may be shared by several disks.
+- **Rotating a key**: give the disk the new key as `key_file` and the old one in
+  `old_key_files`, re-attach it (or restart), run `blockgw ctl SOCK rekey <id>` and wait for
+  "no segment or checkpoint needs an old key any more"; then remove `old_key_files`. Until then,
+  keep the old key: objects sealed with it are still needed.
 
 ## Logs
 

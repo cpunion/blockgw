@@ -176,6 +176,10 @@ fn validate_dev(d: &DevConfig) -> Result<()> {
     if let Some(k) = &d.key_file {
         crypt::load_key(k).with_context(|| format!("device {}", d.id))?;
     }
+    anyhow::ensure!(d.old_key_files.is_empty() || d.key_file.is_some(), "device {}: old_key_files needs a key_file", d.id);
+    for k in &d.old_key_files {
+        crypt::load_key(k).with_context(|| format!("device {}", d.id))?;
+    }
     Ok(())
 }
 
@@ -281,7 +285,10 @@ fn start_disk(dc: DevConfig) -> Result<Arc<Dev>> {
     let ctx = CTX.get().expect("worker context");
     failpoint::hit("open")?;
     let store: Arc<dyn store::Store> = match &dc.key_file {
-        Some(k) => Arc::new(crypt::CryptStore::new(ctx.store.clone(), &crypt::load_key(k)?)),
+        Some(k) => {
+            let old = dc.old_key_files.iter().map(|f| crypt::load_key(f)).collect::<Result<Vec<_>>>()?;
+            Arc::new(crypt::CryptStore::with_old_keys(ctx.store.clone(), &crypt::load_key(k)?, &old))
+        }
         None => ctx.store.clone(),
     };
     let d = Arc::new(Dev::open(dc, store)?);
@@ -717,6 +724,10 @@ fn handle_ctl(s: UnixStream) -> Result<()> {
                     Err(e) => format!("error: {e:#}"),
                 }
             }
+            None => "error: no such disk".into(),
+        },
+        ["rekey", id] => match find(id) {
+            Some(d) => d.rekey().unwrap_or_else(|e| format!("error: {e:#}")),
             None => "error: no such disk".into(),
         },
         ["metrics"] => metrics::render_prometheus(&snapshot(devs)).trim_end().to_string(),

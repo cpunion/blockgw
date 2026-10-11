@@ -17,7 +17,7 @@ now_ms() { date +%s%3N; }
 # ID_BASE + slot, image dir $W/NAME/d<i>, object prefix $PREFIX/<shared-or-own key>.
 # DISK_KEYS (optional, space-separated) overrides the per-disk prefix keys so two servers can
 # address the same disk. Optional per-disk settings from the environment: CKPT_EVERY, LAZY,
-# HYDRATE_MBPS, KEY_FILE, SEAL_INTERVAL_MS. Runs inside $(...), so the slot counter lives in $W/ids, not in a variable.
+# HYDRATE_MBPS, KEY_FILE, OLD_KEY_FILE, SEAL_INTERVAL_MS. Runs inside $(...), so the slot counter lives in $W/ids, not in a variable.
 write_config() {
   local name=$1 n=$2 size=$3 policy=${4:-local} devs="" i key id
   local cfg=$W/$name.json   # separate statement: $name must be the local one
@@ -26,7 +26,7 @@ write_config() {
     key=${keys[$i]:-$name-d$i}
     id=$((ID_BASE + $(wc -l < "$W/ids")))
     echo "$id" >> "$W/ids"
-    devs+="${devs:+,}{\"id\":$id,\"size_gb\":$size,\"dir\":\"$W/$name/d$i\",\"prefix\":\"$PREFIX/$key\",\"policy\":\"$policy\"${CKPT_EVERY:+,\"checkpoint_every\":$CKPT_EVERY}${LAZY:+,\"lazy\":$LAZY}${HYDRATE_MBPS:+,\"hydrate_mbps\":$HYDRATE_MBPS}${KEY_FILE:+,\"key_file\":\"$KEY_FILE\"}${SEAL_INTERVAL_MS:+,\"seal_interval_ms\":$SEAL_INTERVAL_MS}}"
+    devs+="${devs:+,}{\"id\":$id,\"size_gb\":$size,\"dir\":\"$W/$name/d$i\",\"prefix\":\"$PREFIX/$key\",\"policy\":\"$policy\"${CKPT_EVERY:+,\"checkpoint_every\":$CKPT_EVERY}${LAZY:+,\"lazy\":$LAZY}${HYDRATE_MBPS:+,\"hydrate_mbps\":$HYDRATE_MBPS}${KEY_FILE:+,\"key_file\":\"$KEY_FILE\"}${OLD_KEY_FILE:+,\"old_key_files\":[\"$OLD_KEY_FILE\"]}${SEAL_INTERVAL_MS:+,\"seal_interval_ms\":$SEAL_INTERVAL_MS}}"
   done
   local store
   if [ "${E2E_STORE:-s3}" = dir ]; then
