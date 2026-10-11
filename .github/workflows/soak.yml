@@ -26,10 +26,10 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { name: soak, slug: soak, cmd: "tests/soak/soak.py --minutes MINUTES --work /tmp/blockgw-long" }
-          - { name: "torture, 4 writers (20 min)", slug: torture, cmd: "tests/torture/torture.py --policy remote --threads 4 --seconds 1200 --work /tmp/blockgw-long" }
-          - { name: "XFS torture (20 min)", slug: fstorture, cmd: "tests/torture/fstorture.py --policy remote --seconds 1200 --work /tmp/blockgw-long" }
-          - { name: "takeover torture (20 min)", slug: fencetorture, cmd: "tests/torture/fencetorture.py --policy remote --seconds 1200 --work /tmp/blockgw-long" }
+          - { name: soak, slug: soak, cmd: "tests/soak/soak.py --minutes MINUTES --work /mnt/blockgw-long" }
+          - { name: "torture, 4 writers (20 min)", slug: torture, cmd: "tests/torture/torture.py --policy remote --threads 4 --seconds 1200 --max-copies 20 --work /mnt/blockgw-long" }
+          - { name: "XFS torture (20 min)", slug: fstorture, cmd: "tests/torture/fstorture.py --policy remote --seconds 1200 --max-copies 20 --work /mnt/blockgw-long" }
+          - { name: "takeover torture (20 min)", slug: fencetorture, cmd: "tests/torture/fencetorture.py --policy remote --seconds 1200 --work /mnt/blockgw-long" }
     steps:
       - uses: actions/checkout@v5
       - name: Install dependencies and load ublk
@@ -40,8 +40,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo build --release
-      - name: Run
+      - name: Run (work dir on the runner's larger temporary disk)
         run: |
+          df -h / /mnt
           cmd="${{ matrix.cmd }}"
           cmd="${cmd/MINUTES/${{ github.event.inputs.minutes || '45' }}}"
           sudo python3 $cmd --blockgw target/release/blockgw --seed ${{ github.run_id }}
@@ -51,5 +52,5 @@ jobs:
         with:
           name: long-${{ matrix.slug }}
           path: |
-            /tmp/blockgw-long/**/*.log
-            /tmp/blockgw-long/**/samples.json
+            /mnt/blockgw-long/**/*.log
+            /mnt/blockgw-long/**/samples.json
