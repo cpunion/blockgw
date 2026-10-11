@@ -386,8 +386,18 @@ chunk i: XChaCha20-Poly1305 of plaintext bytes [i * 64 KiB, (i + 1) * 64 KiB), p
   before the device is attached.
 - **Key handling**: 32 bytes per disk, read from a file (64 hex digits or raw) that must not be
   accessible by group or others. One key may serve several disks; the key name in the associated
-  data keeps their objects apart. Losing the key loses the disk. Rotation is not implemented: the
-  key of an existing disk cannot change.
+  data keeps their objects apart. Losing the key loses the disk.
+- **Rotation**: open the disk with the new `key_file` and the old one in `old_key_files`
+  (decrypt only). New objects use the new key; reads try the keys in turn and remember per object
+  which one worked. `ctl rekey <id>` then fetches any absent blocks, rewrites every live block still
+  held by a segment of an earlier epoch, checkpoints twice so GC deletes those segments and the old
+  checkpoints, and checks that every remaining segment and checkpoint opens with the new key. After
+  that the old key can be dropped. Tombstones and epoch markers keep the old key; they are never
+  read.
+- **A server that cannot read the log changes nothing.** Before claiming an epoch (which fences
+  whoever serves the disk now), opening reads the newest checkpoint, or the newest segment. A wrong
+  or missing key fails there; it used to fail only after the claim, so a misconfigured host could
+  fence out a healthy writer.
 - Listings report plaintext sizes, so size-based checks (tombstone detection) are unchanged.
 - **Not hidden**: object names, sizes and timing (how much and when a disk writes) remain visible
   to the store. The local image on the host is not encrypted by blockgw (use dm-crypt or an
@@ -454,7 +464,6 @@ The torture test runs in CI with `--encrypt` as well (remote policy), and e2e ca
 1. A bounded local cache: lazy restore fetches on first read and hydrates in the background, but
    a host still ends up holding the full image; evicting cold, uploaded blocks is not done.
 2. Standby replication of unflushed writes.
-3. Key rotation for encrypted disks.
 
 ## 7. Alternatives considered
 

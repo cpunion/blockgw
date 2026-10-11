@@ -17,6 +17,9 @@
 //! * Listings report plaintext sizes, so size-based checks (tombstones) work unchanged.
 //! * Fail closed: with a key configured, an object that is not encrypted is an error, never
 //!   accepted as plaintext.
+//! * Key rotation: objects are always written with the current key; old keys (decrypt only) are
+//!   tried in turn when the current one fails, and the key that worked is remembered per object.
+//!   `Dev::rekey` rewrites everything still sealed with an old key, after which the old key can go.
 
 use crate::store::{PutOutcome, Store};
 use anyhow::{bail, ensure, Context, Result};
@@ -78,13 +81,21 @@ fn plain_len(size: u64) -> u64 {
 
 pub struct CryptStore {
     inner: Arc<dyn Store>,
-    aead: XChaCha20Poly1305,
-    headers: Mutex<HashMap<String, [u8; HEADER]>>,
+    /// [current key, old keys...]: writes use the first, reads try them in order
+    aeads: Vec<XChaCha20Poly1305>,
+    /// per object: header and the index of the key that opened it
+    headers: Mutex<HashMap<String, ([u8; HEADER], usize)>>,
 }
 
 impl CryptStore {
+    #[cfg(test)]
     pub fn new(inner: Arc<dyn Store>, key: &[u8; 32]) -> Self {
-        CryptStore { inner, aead: XChaCha20Poly1305::new(key.into()), headers: Mutex::new(HashMap::new()) }
+        Self::with_old_keys(inner, key, &[])
+    }
+
+    pub fn with_old_keys(inner: Arc<dyn Store>, key: &[u8; 32], old: &[[u8; 32]]) -> Self {
+        let aeads = std::iter::once(key).chain(old).map(|k| XChaCha20Poly1305::new(k.into())).collect();
+        CryptStore { inner, aeads, headers: Mutex::new(HashMap::new()) }
     }
 
     fn nonce(hdr: &[u8; HEADER], i: u64) -> XNonce {
@@ -112,8 +123,7 @@ impl CryptStore {
         for i in 0..chunks_for(body.len() as u64) {
             let s = (i * CHUNK) as usize;
             let e = (s + CHUNK as usize).min(body.len());
-            let ct = self
-                .aead
+            let ct = self.aeads[0]
                 .encrypt(&Self::nonce(&hdr, i), Payload { msg: &body[s..e], aad: &aad })
                 .map_err(|_| anyhow::anyhow!("encrypt"))?;
             out.extend_from_slice(&ct);
@@ -129,26 +139,31 @@ impl CryptStore {
         Ok(b[..HEADER].try_into().unwrap())
     }
 
-    fn remember(&self, key: &str, hdr: [u8; HEADER]) {
+    fn remember(&self, key: &str, hdr: [u8; HEADER], kidx: usize) {
         let mut h = self.headers.lock().unwrap();
         if h.len() >= HEADER_CACHE {
             h.clear();
         }
-        h.insert(key.to_string(), hdr);
+        h.insert(key.to_string(), (hdr, kidx));
     }
 
-    /// Decrypt consecutive chunks starting at chunk `first`.
-    fn open_chunks(&self, key: &str, hdr: &[u8; HEADER], first: u64, ct: &[u8]) -> Result<Vec<u8>> {
+    /// Decrypt consecutive chunks starting at chunk `first`, with key `kidx` if known, else with
+    /// the first key that opens the first chunk. Returns the plaintext and the key index.
+    fn open_chunks(&self, key: &str, hdr: &[u8; HEADER], first: u64, ct: &[u8], kidx: Option<usize>) -> Result<(Vec<u8>, usize)> {
         let aad = Self::aad(key, hdr);
-        let mut out = Vec::with_capacity(ct.len());
-        for (k, c) in ct.chunks((CHUNK + TAG) as usize).enumerate() {
-            let pt = self
-                .aead
-                .decrypt(&Self::nonce(hdr, first + k as u64), Payload { msg: c, aad: &aad })
-                .map_err(|_| anyhow::anyhow!("{key}: decryption failed (wrong key, or the object was modified, moved or truncated)"))?;
+        let failed = || anyhow::anyhow!("{key}: decryption failed (wrong key, or the object was modified, moved or truncated)");
+        let mut chunks = ct.chunks((CHUNK + TAG) as usize);
+        let c0 = chunks.next().unwrap_or(&[]);
+        let open0 = |a: &XChaCha20Poly1305| a.decrypt(&Self::nonce(hdr, first), Payload { msg: c0, aad: &aad }).ok();
+        let (k, mut out) = match kidx {
+            Some(k) => (k, open0(&self.aeads[k]).ok_or_else(failed)?),
+            None => self.aeads.iter().enumerate().find_map(|(k, a)| open0(a).map(|pt| (k, pt))).ok_or_else(failed)?,
+        };
+        for (i, c) in chunks.enumerate() {
+            let pt = self.aeads[k].decrypt(&Self::nonce(hdr, first + 1 + i as u64), Payload { msg: c, aad: &aad }).map_err(|_| failed())?;
             out.extend_from_slice(&pt);
         }
-        Ok(out)
+        Ok((out, k))
     }
 }
 
@@ -167,8 +182,9 @@ impl Store for CryptStore {
         let hdr = Self::parse_header(key, &obj)?;
         let plain = hdr_plain_len(&hdr);
         ensure!(obj.len() as u64 == sealed_len(plain), "{key}: encrypted object has the wrong size (truncated?)");
-        let pt = self.open_chunks(key, &hdr, 0, &obj[HEADER..])?;
-        self.remember(key, hdr);
+        let kidx = self.headers.lock().unwrap().get(key).map(|(_, k)| *k);
+        let (pt, k) = self.open_chunks(key, &hdr, 0, &obj[HEADER..], kidx)?;
+        self.remember(key, hdr, k);
         Ok(pt)
     }
 
@@ -177,6 +193,8 @@ impl Store for CryptStore {
             return Ok(Vec::new());
         }
         let cached = self.headers.lock().unwrap().get(key).copied();
+        let kidx = cached.map(|(_, k)| k);
+        let cached = cached.map(|(h, _)| h);
         let end_hint = cached.map(|h| hdr_plain_len(&h)).unwrap_or(u64::MAX);
         if off >= end_hint {
             return Ok(Vec::new());
@@ -204,8 +222,8 @@ impl Store for CryptStore {
         let want_chunks = (plain.min(end).saturating_sub(1)) / CHUNK + 1 - c0;
         let expect = (c0..c0 + want_chunks).map(|c| (plain - c * CHUNK).min(CHUNK) + TAG).sum::<u64>();
         ensure!(ct.len() as u64 >= expect, "{key}: encrypted object truncated");
-        let pt = self.open_chunks(key, &hdr, c0, &ct[..expect as usize])?;
-        self.remember(key, hdr);
+        let (pt, k) = self.open_chunks(key, &hdr, c0, &ct[..expect as usize], kidx)?;
+        self.remember(key, hdr, k);
         let s = (off - c0 * CHUNK) as usize;
         let e = (end.min(plain) - c0 * CHUNK) as usize;
         Ok(pt[s..e].to_vec())
@@ -218,6 +236,11 @@ impl Store for CryptStore {
     fn delete(&self, key: &str) -> Result<()> {
         self.headers.lock().unwrap().remove(key);
         self.inner.delete(key)
+    }
+
+    fn needs_old_key(&self, key: &str) -> Result<bool> {
+        self.get_range(key, 0, 1)?;
+        Ok(self.headers.lock().unwrap().get(key).is_some_and(|(_, k)| *k > 0))
     }
 }
 
@@ -281,6 +304,26 @@ mod tests {
         }
         let l = st.list_sized("p/").unwrap();
         assert_eq!(l, vec![("p/empty".into(), 0), ("p/seg/1".into(), body.len() as u64), ("p/tomb".into(), 4)]);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn old_keys_still_read_and_new_writes_use_the_current_key() {
+        let d = tmp("rotate");
+        let inner: Arc<dyn Store> = Arc::new(LocalDir::new(&d).unwrap());
+        let old = CryptStore::new(inner.clone(), &[1u8; 32]);
+        let body = data(CHUNK as usize + 300);
+        old.put_new("a", &body).unwrap();
+        let rotated = CryptStore::with_old_keys(inner.clone(), &[2u8; 32], &[[1u8; 32]]);
+        assert_eq!(rotated.get_range("a", 10, CHUNK).unwrap(), &body[10..10 + CHUNK as usize]);
+        assert_eq!(rotated.get("a").unwrap(), body);
+        assert!(rotated.needs_old_key("a").unwrap());
+        rotated.put_new("b", &body).unwrap();
+        assert!(!rotated.needs_old_key("b").unwrap());
+        // the new key alone reads b, not a; the old key alone reads a, not b
+        let new_only = CryptStore::new(inner.clone(), &[2u8; 32]);
+        assert!(new_only.get("b").is_ok() && new_only.get("a").is_err());
+        assert!(CryptStore::new(inner.clone(), &[1u8; 32]).get("b").is_err());
         let _ = std::fs::remove_dir_all(&d);
     }
 
