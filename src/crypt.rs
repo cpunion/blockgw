@@ -328,6 +328,7 @@ mod tests {
         std::fs::create_dir_all(&d).unwrap();
         let p = d.join("k");
         let w = |c: &[u8], mode: u32| {
+            let _ = std::fs::remove_file(&p); // the previous key may be read-only
             std::fs::write(&p, c).unwrap();
             std::fs::set_permissions(&p, std::fs::Permissions::from_mode(mode)).unwrap();
             load_key(p.to_str().unwrap())
