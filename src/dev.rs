@@ -11,11 +11,14 @@
 //! After a crash of the process or host, regions whose intent bit is set are re-uploaded on the
 //! next open before the device is attached.
 
-use crate::log::{self, SegmentBuilder};
+use crate::extmap::ExtentMap;
+use crate::log;
+use crate::restore;
+use crate::segment::{self, Builder};
 use crate::store::{PutOutcome, Store};
 use crate::track::{CommitTracker, RegionTracker};
-use anyhow::{bail, Context, Result};
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use anyhow::{bail, Result};
+use std::collections::{BTreeSet, VecDeque};
 use std::fs::{File, OpenOptions};
 use std::os::unix::fs::{FileExt, OpenOptionsExt};
 use std::os::unix::io::{AsRawFd, RawFd};
@@ -28,6 +31,8 @@ pub const REGION: u64 = 4 << 20; // write-intent granularity
 pub const MAX_SEG: usize = 16 << 20; // seal early above this
 pub const WINDOW: u64 = 8; // concurrent PUTs per disk
 pub const FENCE_SPAN: u64 = 2 * WINDOW; // seqs past the old writer's max that a new writer tombstones
+pub const CKPT_EVERY: u64 = 64; // checkpoint after this many committed segments...
+pub const CKPT_INTERVAL_SECS: u64 = 60; // ...or this long after the last one, if anything committed
 pub const POLICY_LOCAL: u8 = 0;
 pub const POLICY_REMOTE: u8 = 1;
 
@@ -61,7 +66,7 @@ fn default_queues() -> u16 {
 
 struct Sealed {
     seq: u64,
-    raw: Arc<Vec<u8>>,
+    seg: Arc<Builder>,
 }
 
 enum Want {
@@ -109,8 +114,13 @@ pub struct Dev {
     intent_file: File,
     regions: Mutex<Regions>,
     pending_recovery: Mutex<Vec<u64>>,
-    open: Mutex<SegmentBuilder>,
+    open: Mutex<Builder>,
     queue: Mutex<Queue>,
+    /// committed extent map; updated in commit order, together with `committed`
+    cmap: Mutex<ExtentMap>,
+    store: Arc<dyn Store>,
+    last_ckpt: AtomicU64, // `committed` value covered by the last checkpoint
+    last_ckpt_at: Mutex<Instant>,
     queue_cv: Condvar,
     pub epoch: u64,
     next_seq: AtomicU64,
@@ -124,7 +134,8 @@ pub struct Dev {
 impl Dev {
     /// Open the disk: claim a new epoch (fencing any previous writer), catch up with segments other
     /// hosts wrote (or restore everything on a fresh host), and note regions a crashed run left dirty.
-    pub fn open(cfg: DevConfig, s3: &dyn Store) -> Result<Dev> {
+    pub fn open(cfg: DevConfig, store: Arc<dyn Store>) -> Result<Dev> {
+        let s3 = store.as_ref();
         let dir = PathBuf::from(&cfg.dir);
         std::fs::create_dir_all(&dir)?;
         let size = cfg.size_gb << 30;
@@ -143,48 +154,38 @@ impl Dev {
 
         let epoch = claim_epoch(s3, &p)?;
 
-        // Catch up: every epoch newer than ours (all of them on a fresh host). Within an epoch only the
-        // contiguous prefix up to the first gap or tombstone is valid.
-        let mut by_epoch: BTreeMap<u64, Vec<(u64, String)>> = BTreeMap::new();
-        for k in s3.list(&format!("{p}/seg/"))? {
-            if let Some((e, sq)) = log::parse_seg_key(&k) {
-                if e < epoch && (fresh || e > st.epoch) {
-                    by_epoch.entry(e).or_default().push((sq, k));
-                }
+        // Rebuild from the object store: the newest checkpoint, then the segments after it.
+        let plan = restore::plan(s3, &p, epoch)?;
+        let mut cmap = ExtentMap::create(&dir.join("cmap"), size)?;
+        let t0 = Instant::now();
+        let foreign = st.epoch == 0 || restore::has_foreign_data(s3, &plan, st.epoch)?;
+        if fresh || foreign {
+            if !fresh && !dirty.is_empty() && foreign && st.epoch != 0 {
+                bail!("disk {} diverged: local writes were never uploaded and another host has written since", cfg.id);
             }
+            // the image is rebuilt from the store: start from an empty (all-holes) file
+            image.set_len(0)?;
+            image.set_len(size)?;
+            let replay = OpenOptions::new().write(true).open(dir.join("data"))?;
+            let r = restore::restore_full(s3, &p, &plan, &mut cmap, &replay)?;
+            replay.sync_all()?;
+            crate::info!(
+                "disk {}: restored from the object store in {} ms ({} MiB of live data from {}, then {} segments)",
+                cfg.id,
+                t0.elapsed().as_millis(),
+                r.live_bytes >> 20,
+                plan.ckpt.as_ref().map(|(k, _)| k.as_str()).unwrap_or("no checkpoint"),
+                r.segments
+            );
+        } else {
+            let n = restore::rebuild_map(s3, &p, &plan, &mut cmap)?;
+            crate::info!("disk {}: extent map rebuilt in {} ms (checkpoint + {n} segment metas)", cfg.id, t0.elapsed().as_millis());
         }
-        let replay = OpenOptions::new().write(true).open(dir.join("data"))?;
-        let mut applied = 0;
-        for (e, mut keys) in by_epoch {
-            keys.sort();
-            let seqs: Vec<u64> = keys.iter().map(|(s, _)| *s).collect();
-            let n = log::contiguous_prefix(&seqs);
-            'epoch: for chunk in keys[..n].chunks(16) {
-                let objs: Vec<Result<Vec<u8>>> = std::thread::scope(|sc| {
-                    let hs: Vec<_> = chunk.iter().map(|(_, k)| sc.spawn(move || s3.get(k))).collect();
-                    hs.into_iter().map(|h| h.join().unwrap()).collect()
-                });
-                for ((sq, k), obj) in chunk.iter().zip(objs) {
-                    let Some(raw) = log::from_object(&obj?)? else { break 'epoch };
-                    if !dirty.is_empty() && !fresh {
-                        bail!("disk {} diverged: local writes were never uploaded and another host wrote {k}", cfg.id);
-                    }
-                    log::apply(&replay, &raw, e, *sq).with_context(|| format!("apply {k}"))?;
-                    applied += 1;
-                }
-            }
-        }
-        replay.sync_all()?;
         let tmp = dir.join("state.json.tmp");
         std::fs::write(&tmp, serde_json::to_vec(&LocalState { epoch })?)?;
         File::open(&tmp)?.sync_all()?;
         std::fs::rename(&tmp, dir.join("state.json"))?;
-        crate::info!(
-            "disk {}: epoch {epoch} (local was {}), fresh={fresh}, applied {applied} foreign segments, {} dirty regions to re-upload",
-            cfg.id,
-            st.epoch,
-            dirty.len()
-        );
+        crate::info!("disk {}: epoch {epoch} (local was {}), fresh={fresh}, {} dirty regions to re-upload", cfg.id, st.epoch, dirty.len());
 
         let policy = if cfg.policy == "remote" { POLICY_REMOTE } else { POLICY_LOCAL };
         Ok(Dev {
@@ -195,8 +196,12 @@ impl Dev {
             intent_file,
             regions: Mutex::new(Regions { t: tracker, cleared_unsynced: false, last_sync: Instant::now() }),
             pending_recovery: Mutex::new(dirty),
-            open: Mutex::new(SegmentBuilder::default()),
+            open: Mutex::new(Builder::default()),
             queue: Mutex::new(Queue::default()),
+            cmap: Mutex::new(cmap),
+            store,
+            last_ckpt: AtomicU64::new(0),
+            last_ckpt_at: Mutex::new(Instant::now()),
             queue_cv: Condvar::new(),
             epoch,
             next_seq: AtomicU64::new(0),
@@ -293,11 +298,10 @@ impl Dev {
             return self.next_seq.load(SeqCst);
         }
         let seq = self.next_seq.fetch_add(1, SeqCst);
-        let raw = o.encode(self.epoch, seq);
-        *o = SegmentBuilder::default();
+        let seg = std::mem::take(&mut *o);
         let mut q = self.queue.lock().unwrap();
-        q.bytes += raw.len() as u64;
-        q.sealed.push_back(Sealed { seq, raw: Arc::new(raw) });
+        q.bytes += seg.size() as u64;
+        q.sealed.push_back(Sealed { seq, seg: Arc::new(seg) });
         drop(q);
         drop(o);
         self.queue_cv.notify_all();
@@ -410,6 +414,42 @@ impl Dev {
         }
     }
 
+    /// Upload a checkpoint of the committed extent map if anything committed since the last one.
+    /// Returns whether one was written.
+    pub fn checkpoint(&self) -> Result<bool> {
+        let (bytes, c) = {
+            let map = self.cmap.lock().unwrap();
+            let c = self.committed.load(SeqCst);
+            if c == 0 || c == self.last_ckpt.load(SeqCst) || self.fenced.load(SeqCst) {
+                return Ok(false);
+            }
+            (map.encode_checkpoint(self.epoch, c - 1), c)
+        };
+        let key = log::key_ckpt(&self.cfg.prefix, self.epoch, c - 1);
+        self.store.put_new(&key, &bytes)?; // Exists: an earlier attempt landed; same content
+        self.last_ckpt.store(c, SeqCst);
+        *self.last_ckpt_at.lock().unwrap() = Instant::now();
+        crate::debug!("disk {}: checkpoint {key} ({} bytes)", self.cfg.id, bytes.len());
+        Ok(true)
+    }
+
+    /// Checkpoint every CKPT_EVERY committed segments, or every CKPT_INTERVAL_SECS if anything committed.
+    pub fn checkpointer(&self) {
+        loop {
+            std::thread::sleep(std::time::Duration::from_secs(2));
+            if self.fenced.load(SeqCst) {
+                return;
+            }
+            let (c, last) = (self.committed.load(SeqCst), self.last_ckpt.load(SeqCst));
+            let due = c >= last + CKPT_EVERY || (c > last && self.last_ckpt_at.lock().unwrap().elapsed().as_secs() >= CKPT_INTERVAL_SECS);
+            if due {
+                if let Err(e) = self.checkpoint() {
+                    crate::warn!("disk {}: checkpoint failed (will retry): {e:#}", self.cfg.id);
+                }
+            }
+        }
+    }
+
     /// Hands sealed segments to the shared pool in seq order, at most WINDOW beyond the committed prefix.
     pub fn dispatcher(self: &Arc<Self>, pool: &Pool) {
         loop {
@@ -420,7 +460,7 @@ impl Dev {
                         return;
                     }
                     let committed = self.committed.load(SeqCst);
-                    let next = q.sealed.iter().find(|s| s.seq >= q.dispatched).map(|s| (s.seq, s.raw.clone()));
+                    let next = q.sealed.iter().find(|s| s.seq >= q.dispatched).map(|s| (s.seq, s.seg.clone()));
                     match next {
                         Some((seq, raw)) if seq < committed + WINDOW => {
                             q.dispatched = seq + 1;
@@ -442,12 +482,18 @@ impl Dev {
                 self.stats.puts.fetch_add(1, Relaxed);
                 self.stats.put_bytes.fetch_add(obj_len as u64, Relaxed);
                 self.stats.raw_bytes.fetch_add(raw_len as u64, Relaxed);
-                for s in q.commits.complete(seq) {
-                    let front = q.sealed.pop_front().expect("committed segment is queued");
-                    debug_assert_eq!(front.seq, s);
-                    q.bytes -= front.raw.len() as u64;
+                let newly = q.commits.complete(seq);
+                if !newly.is_empty() {
+                    // the map and `committed` move together, so a checkpoint is always consistent
+                    let mut map = self.cmap.lock().unwrap();
+                    for s in newly {
+                        let front = q.sealed.pop_front().expect("committed segment is queued");
+                        debug_assert_eq!(front.seq, s);
+                        q.bytes -= front.seg.size() as u64;
+                        map.apply(self.epoch, s, &front.seg.entries);
+                    }
+                    self.committed.store(q.commits.committed(), SeqCst);
                 }
-                self.committed.store(q.commits.committed(), SeqCst);
             }
             PutOutcome::Exists => {
                 if !self.fenced.swap(true, SeqCst) {
@@ -497,7 +543,7 @@ pub fn signal(fd: RawFd) {
     unsafe { libc::write(fd, &one as *const u64 as *const libc::c_void, 8) };
 }
 
-type Job = (Arc<Dev>, u64, Arc<Vec<u8>>);
+type Job = (Arc<Dev>, u64, Arc<Builder>);
 
 /// Process-wide upload pool shared by every disk.
 pub struct Pool {
@@ -513,7 +559,7 @@ impl Pool {
     /// Compress (skipped for incompressible data), create-only PUT, retry transient errors.
     pub fn worker(&self, s3: &dyn Store) {
         loop {
-            let (dev, seq, raw) = {
+            let (dev, seq, seg) = {
                 let mut j = self.jobs.lock().unwrap();
                 while j.is_empty() {
                     j = self.cv.wait(j).unwrap();
@@ -523,7 +569,7 @@ impl Pool {
             if let Err(e) = crate::failpoint::hit("upload") {
                 crate::warn!("disk {}: {e}", dev.cfg.id);
             }
-            let obj = log::to_object(&raw);
+            let obj = segment::encode(dev.epoch, seq, &seg);
             let key = log::key_seg(&dev.cfg.prefix, dev.epoch, seq);
             let mut backoff = 100;
             let t0 = Instant::now();
@@ -544,7 +590,7 @@ impl Pool {
                     }
                 }
             };
-            dev.complete(seq, raw.len(), obj.len(), outcome);
+            dev.complete(seq, seg.size(), obj.len(), outcome);
         }
     }
 }

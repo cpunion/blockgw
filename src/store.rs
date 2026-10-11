@@ -18,6 +18,8 @@ pub trait Store: Send + Sync {
     /// Create `key` with `body` unless it already exists (then `Exists`, and nothing is written).
     fn put_new(&self, key: &str, body: &[u8]) -> Result<PutOutcome>;
     fn get(&self, key: &str) -> Result<Vec<u8>>;
+    /// Bytes `[off, off + len)` of `key` (fewer if the object is shorter).
+    fn get_range(&self, key: &str, off: u64, len: u64) -> Result<Vec<u8>>;
     /// All keys starting with `prefix`, sorted.
     fn list(&self, prefix: &str) -> Result<Vec<String>>;
 }
@@ -79,6 +81,17 @@ impl Store for LocalDir {
         fs::read(&p).with_context(|| format!("read {}", p.display()))
     }
 
+    fn get_range(&self, key: &str, off: u64, len: u64) -> Result<Vec<u8>> {
+        use std::os::unix::fs::FileExt;
+        let p = self.path(key)?;
+        let f = File::open(&p).with_context(|| format!("open {}", p.display()))?;
+        let size = f.metadata()?.len();
+        let n = len.min(size.saturating_sub(off)) as usize;
+        let mut buf = vec![0u8; n];
+        f.read_exact_at(&mut buf, off)?;
+        Ok(buf)
+    }
+
     fn list(&self, prefix: &str) -> Result<Vec<String>> {
         // walk from the deepest directory the prefix names, then filter by the full prefix
         let base = match prefix.rfind('/') {
@@ -133,6 +146,8 @@ mod tests {
         assert!(matches!(s.put_new("d/seg/0001/0000", b"one").unwrap(), PutOutcome::Created));
         assert!(matches!(s.put_new("d/seg/0001/0000", b"two").unwrap(), PutOutcome::Exists));
         assert_eq!(s.get("d/seg/0001/0000").unwrap(), b"one", "the losing writer changed nothing");
+        assert_eq!(s.get_range("d/seg/0001/0000", 1, 1).unwrap(), b"n");
+        assert_eq!(s.get_range("d/seg/0001/0000", 2, 100).unwrap(), b"e", "clamped at the end");
         assert!(s.get("d/seg/0001/0001").is_err());
         // no temporary files are left behind
         assert_eq!(fs::read_dir(root.join("d/seg/0001")).unwrap().count(), 1);

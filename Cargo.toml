@@ -23,6 +23,8 @@ rusty-s3 = "0.10"
 ureq = "2"
 url = "2"
 anyhow = "1"
+memmap2 = "0.9"
+crc32fast = "1"
 
 [profile.release]
 debug = 1

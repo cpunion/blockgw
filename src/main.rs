@@ -13,11 +13,14 @@
 //!   DISCARD / WRITE_ZEROES -> punch hole -> record in open segment
 
 mod dev;
+mod extmap;
 mod failpoint;
 mod log;
 mod logx;
 mod metrics;
+mod restore;
 mod s3;
+mod segment;
 mod store;
 mod supervise;
 mod track;
@@ -133,10 +136,12 @@ fn worker(path: &str) -> Result<()> {
     let mut devs = Vec::new();
     for dc in cfg.devices.clone() {
         failpoint::hit("open")?;
-        let d = Arc::new(Dev::open(dc, s3.as_ref())?);
+        let d = Arc::new(Dev::open(dc, s3.clone())?);
         let (d2, p2) = (d.clone(), pool.clone());
         std::thread::Builder::new().name(format!("disp-{}", d.cfg.id)).spawn(move || d2.dispatcher(&p2))?;
         d.recover()?; // before attach: the crashed run's un-uploaded tail goes first
+        let d3 = d.clone();
+        std::thread::Builder::new().name(format!("ckpt-{}", d.cfg.id)).spawn(move || d3.checkpointer())?;
         devs.push(d);
     }
     let ctl_devs = devs.clone();
@@ -163,6 +168,9 @@ fn worker(path: &str) -> Result<()> {
             let t0 = std::time::Instant::now();
             while d.committed.load(SeqCst) < need && !d.fenced.load(SeqCst) && t0.elapsed().as_secs() < 60 {
                 std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            if let Err(e) = d.checkpoint() {
+                warn!("disk {}: checkpoint on shutdown failed: {e:#}", d.cfg.id);
             }
             info!("disk {}: drained to seq {} on shutdown", d.cfg.id, d.committed.load(SeqCst));
         }
@@ -203,6 +211,10 @@ fn run_disk(d: Arc<Dev>) -> Result<()> {
         t.fds[t.nr_fds as usize] = fd;
         t.nr_fds += 1;
         dev.set_default_params(size);
+        // 4 KiB logical blocks: every I/O is block aligned, which the extent map relies on
+        dev.tgt.params.basic.logical_bs_shift = 12;
+        dev.tgt.params.basic.physical_bs_shift = 12;
+        dev.tgt.params.basic.io_min_shift = 12;
         let p = &mut dev.tgt.params;
         p.types |= libublk::sys::UBLK_PARAM_TYPE_DISCARD;
         p.discard.discard_granularity = 4096;
@@ -371,7 +383,12 @@ fn handle_ctl(s: UnixStream, devs: &[Arc<Dev>]) -> Result<()> {
                 while d.committed.load(SeqCst) < need && !d.fenced.load(SeqCst) {
                     std::thread::sleep(std::time::Duration::from_millis(5));
                 }
-                format!("ok disk {id} drained to seq {need} in {} ms", t0.elapsed().as_millis())
+                let ck = match d.checkpoint() {
+                    Ok(true) => "checkpointed",
+                    Ok(false) => "checkpoint current",
+                    Err(_) => "checkpoint failed",
+                };
+                format!("ok disk {id} drained to seq {need} in {} ms, {ck}", t0.elapsed().as_millis())
             }
             None => "error: no such disk".into(),
         },

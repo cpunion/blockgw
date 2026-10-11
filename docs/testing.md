@@ -24,7 +24,10 @@ CI runs the unit layer and the end-to-end suite on every pull request
 
 | Module | Tests cover |
 |---|---|
-| `src/log.rs` | key encoding (numeric order), segment encode/decode round trip, rejection of corrupt segments (truncation, trailing bytes, overflowing entry counts, unknown kinds), header/key mismatch, object codec (zstd vs raw for incompressible data, tombstones), applying writes and discards to an image, contiguous-prefix rule, fence targets covering gaps and the in-flight window |
+| `src/log.rs` | key encoding (numeric order) for segments, epochs and checkpoints; tombstone detection; contiguous-prefix rule; fence targets covering gaps and the in-flight window |
+| `src/segment.rs` | v2 round trip with compressible and incompressible frames; 200 random ranged reads match the data stream; discard-only segments; detection of meta checksum, frame checksum, truncated meta or frames, and bad magic |
+| `src/extmap.rs` | map follows the latest location and holes (overwrite, discard); runs; checkpoint round trip, including a disk-size mismatch and a truncated checkpoint; fetch plan groups by segment in data order |
+| `src/restore.rs` | a log with a checkpoint, later segments, a tombstone and junk past it: full restore and map-only rebuild both equal a straight replay; plan without a checkpoint stops each epoch at its first gap; foreign-data detection |
 | `src/store.rs` | local-directory store: create-only PUT with exactly one winner among 16 concurrent creators, no temporary files left behind, sorted prefix listing (including a partial last component), rejection of keys that would escape the root |
 | `src/metrics.rs` | Prometheus exposition: HELP/TYPE per family, one sample per disk, every sample line parses; JSON snapshot round trip |
 | `src/logx.rs` | RFC 3339 UTC timestamps (including a leap day and 2099), level parsing and ordering |
@@ -60,6 +63,7 @@ CI runs the unit layer and the end-to-end suite on every pull request
 | `13_sigterm_drains` | with uploads slowed by a failpoint, `SIGTERM` drains the backlog (about 50 MB) before exit; a restore shows the object store holds everything |
 | `14_no_supervisor_auto_attach` | without the supervisor, a plain restart after `kill -9` re-attaches the existing device; data intact, writes work |
 | `15_metrics_and_ops` | `/metrics` serves every family and returns 404 for other paths; `puts_total` grows with writes; lag is 0 after a drain; `ctl metrics` matches HTTP; `stats json` parses; `check-config` accepts a valid config and rejects duplicate ids; `--version`; log lines are timestamped and leveled |
+| `16_checkpoint_restore` | 20 overwrites of the same 8 MiB: drain writes a checkpoint; a restore uses it and fetches about 8 MiB of live data out of about 160 MiB uploaded; image identical |
 
 Failpoints (`src/failpoint.rs`) let a case make the server fail at a named place:
 

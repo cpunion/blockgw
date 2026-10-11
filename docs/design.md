@@ -126,14 +126,42 @@ Object layout:
 ```
 <prefix>/epoch/<e:010>          empty; created with If-None-Match: * by the writer that owns epoch e
 <prefix>/seg/<e:010>/<s:012>    segment s of epoch e, or the 4-byte tombstone "TOMB"
+<prefix>/ckpt/<e:010>/<s:012>   checkpoint: the committed extent map after segment s of epoch e
 ```
 
-Segment format (inside the object, after a one-byte codec: 0 = raw, 1 = zstd):
+Segment format v2. The layout lets a reader fetch only the frames it needs with ranged GETs:
 
 ```
-"BGS1" | epoch u64 | seq u64 | n u32 | n × (kind u8, offset u64, len u32) | payload of the data entries
-kind 0 = data, 1 = discard
+header (40 B): "BGS2" | epoch u64 | seq u64 | n_entries u32 | n_frames u32 | frame_size u32 | meta_len u32 | crc32(meta) u32
+meta:          n_entries × (kind u8, disk_off u64, len u32, data_off u64)          kind 0 = data, 1 = discard
+               n_frames  × (obj_off u64, obj_len u32, raw_len u32, codec u8, crc32(raw) u32)
+frames:        the data stream cut into 256 KiB frames, each raw or zstd, independently decodable
 ```
+
+- Every entry is a multiple of the 4 KiB logical block size: the device advertises 4 KiB logical
+  blocks, so all I/O is block aligned.
+- `data_off` is the entry's position in the data stream; frame `i` covers bytes
+  `[i × frame_size, i × frame_size + raw_len)` of it.
+- Every frame carries a crc32 of its raw bytes, and the meta carries one too.
+
+### 3.3a Extent map and checkpoints
+
+Each disk keeps a **committed extent map**:
+
+- **Contents**: for every 4 KiB block, the segment and data block holding its committed contents,
+  or nothing (a hole).
+- **Consistency**: it is updated only when segments commit, in commit order, under the same lock
+  that advances the committed position. A snapshot is therefore always consistent with a log
+  position.
+- **Storage**: a memory-mapped file of 8-byte entries; only touched pages are resident.
+
+A **checkpoint** serializes the map: the segment table, plus runs of blocks that are consecutive in
+the same segment, all zstd-compressed.
+
+- **When**: written every 64 committed segments, or 60 s after the last one if anything committed,
+  and after every `drain` and on SIGTERM.
+- **Validity**: a checkpoint names a committed position. Tombstones only ever fill sequence numbers
+  above the committed prefix, so no later fencing can invalidate a checkpoint.
 
 Replay rule:
 
@@ -168,14 +196,26 @@ disk fenced. All further I/O on it fails with `EIO`, and it logs `FENCED`.
 
 ### 3.5 Open and restore
 
-Opening a disk on a host:
+Opening a disk picks the newest checkpoint below the new epoch, plus the segments after it: the
+rest of the checkpoint's epoch, then later epochs, each a contiguous prefix ending at the first gap
+or tombstone. Then:
 
-- **Fresh host** (no local image): replay every epoch below the new one, fetching segments in
-  parallel batches of 16 and applying them in order.
-- **Host that wrote the disk before**: replay only epochs newer than its own. Its own segments are
-  already in its image.
+- **Fresh host, or another host has written since** (an epoch newer than this host's own holds
+  data): the image is rebuilt.
+  - Load the checkpoint into the map.
+  - Fetch every live run from its segment with ranged GETs: 16 segments in parallel, with adjacent
+    frames merged into one request.
+  - Replay the later segments in full.
+
+  After many overwrites, a restore downloads the live data, not the history: in the e2e suite,
+  8 MiB fetched after 160 MiB were uploaded.
+- **Same host, nobody else wrote**: the local image is authoritative. Only the map is rebuilt, from
+  the checkpoint plus the metas of later segments (one small ranged GET each).
 - **Divergence**: if the host has un-uploaded writes (intent bits set) and another host has written
   since, opening fails with a "diverged" error and nothing is overwritten.
+
+The map is always rebuilt from the object store at open, never trusted from a local file that a
+crash may have left half-written.
 
 Then, if intent bits are set (an earlier crash), the server re-uploads those regions before the
 device is attached:
@@ -244,8 +284,8 @@ device is attached:
 ## 6. Not implemented yet
 
 1. Lazy cold reads: today the full image lives on the host and a restore downloads every segment.
-2. Extent-map checkpoints. Restore time grows with segment count.
-3. Garbage collection and repacking: dead segments are never deleted.
+2. Garbage collection and repacking: dead segments are never deleted (the extent map already knows
+   what is live).
 4. Encryption at rest.
 5. Standby replication of unflushed writes.
 
