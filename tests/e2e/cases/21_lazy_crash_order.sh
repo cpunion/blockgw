@@ -3,8 +3,8 @@
 # written data from the image, not from the (stale) bitmap. Uploads are held back by a failpoint so
 # both writes are still un-uploaded when the worker dies.
 blk() { python3 -c "import sys; sys.stdout.buffer.write(sys.argv[1].encode() * 4096)" "$1" > "$W/$1.blk"; }
-put() { dd if="$W/$2.blk" of="/dev/ublkb$1" bs=4096 seek="$3" oflag=direct conv=notrunc status=none; }   # put ID PATTERN BLOCK
-get() { dd if="/dev/ublkb$1" bs=4096 skip="$2" count=1 iflag=direct status=none | head -c1; }          # get ID BLOCK -> first byte
+put() { dd if="$W/$2.blk" of="$(blkdev $1)" bs=4096 seek="$3" oflag=direct conv=notrunc status=none; }   # put ID PATTERN BLOCK
+get() { dd if="$(blkdev $1)" bs=4096 skip="$2" count=1 iflag=direct status=none | head -c1; }          # get ID BLOCK -> first byte
 for p in A B a b; do blk $p; done
 X=2048; Y=133120   # 8 MiB and 520 MiB: different write-intent regions
 cfg=$(write_config a 1 2)

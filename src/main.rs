@@ -6,6 +6,7 @@
 //!   blockgw ctl SOCKET <command...>          policy <id> local|remote | lag <id> <MiB> | drain <id> | stats
 //!                                            | attach <disk JSON> | detach <id> [purge]
 //!   blockgw del <ublk-id>                    stop and delete a ublk device
+//!   blockgw replica --listen ADDR --dir DIR  run a standby that keeps acknowledged writes (see replica.rs)
 //!
 //! Data path per I/O (queue thread, io_uring shared with the ublk queue):
 //!   READ  -> read from the local sparse data file (O_DIRECT)
@@ -22,6 +23,7 @@ mod log;
 mod logx;
 mod metrics;
 mod presence;
+mod replica;
 mod restore;
 mod s3;
 mod segment;
@@ -127,6 +129,12 @@ fn main() -> Result<()> {
             Ok(())
         }
         Some("ctl") => ctl(&args[2], &args[3..].join(" ")),
+        Some("replica") => {
+            let opt = |name: &str| args.iter().position(|a| a == name).and_then(|i| args.get(i + 1)).cloned();
+            let listen = opt("--listen").context("replica needs --listen HOST:PORT")?;
+            let dir = opt("--dir").context("replica needs --dir DIR")?;
+            replica::serve(&listen, &dir)
+        }
         Some("del") => {
             // STOP first (a DEL while the server holds the device deadlocks), then delete asynchronously
             let id: i32 = args.get(2).context("missing ID")?.parse()?;
@@ -302,6 +310,12 @@ fn start_disk(dc: DevConfig) -> Result<Arc<Dev>> {
     std::thread::Builder::new().name(format!("ckpt-{}", d.cfg.id)).spawn(move || d3.checkpointer())?;
     let d4 = d.clone();
     std::thread::Builder::new().name(format!("hydrate-{}", d.cfg.id)).spawn(move || d4.hydrator())?;
+    if let Some(rep) = d.rep.clone() {
+        let (d7, d8) = (d.clone(), d.clone());
+        std::thread::Builder::new()
+            .name(format!("replica-{}", d.cfg.id))
+            .spawn(move || rep.run(move |emit| d7.rep_resync(emit), move || d8.stopped_or_fenced()))?;
+    }
     if d.cfg.cache_mb > 0 {
         let d6 = d.clone();
         std::thread::Builder::new().name(format!("evict-{}", d.cfg.id)).spawn(move || d6.evictor())?;
@@ -547,6 +561,20 @@ async fn flush(d: &Dev) -> i32 {
     let t0 = std::time::Instant::now();
     if d.policy.load(SeqCst) == POLICY_REMOTE {
         wait_efd(|fd| d.wait_committed(need, fd)).await;
+    } else if let Some(rep) = &d.rep {
+        // local with a standby: done once the standby has everything (and whatever was sealed
+        // while it was unavailable is committed); otherwise wait for the object store
+        let ok = match d.rep_flush() {
+            Some(id) => {
+                wait_efd(|fd| rep.wait(id, fd)).await;
+                rep.acked(id)
+            }
+            None => false,
+        };
+        let need = if ok { rep.ungated_below() } else { d.seal() };
+        if d.committed.load(SeqCst) < need {
+            wait_efd(|fd| d.wait_committed(need, fd)).await;
+        }
     } else if d.queued_bytes() > d.max_lag.load(SeqCst) {
         d.stats.lag_waits.fetch_add(1, Relaxed);
         wait_efd(|fd| d.wait_lag_below(d.max_lag.load(SeqCst), fd)).await;

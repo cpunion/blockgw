@@ -18,7 +18,7 @@ use crate::segment::{self, Builder};
 use crate::store::{PutOutcome, Store};
 use crate::track::{CommitTracker, RegionTracker};
 use anyhow::{bail, Context, Result};
-use std::collections::{BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs::{File, OpenOptions};
 use std::os::unix::fs::{FileExt, OpenOptionsExt};
 use std::os::unix::io::{AsRawFd, RawFd};
@@ -85,6 +85,10 @@ pub struct DevConfig {
     /// whose writes are all committed are dropped and fetched again when read
     #[serde(default)]
     pub cache_mb: u64,
+    /// "host:port" of a standby (`blockgw replica`) that keeps acknowledged writes until they are
+    /// in the object store; under `local`, a flush then returns once the standby has them
+    #[serde(default)]
+    pub replica: Option<String>,
 }
 fn default_ckpt_mb() -> u64 {
     64
@@ -215,6 +219,10 @@ pub struct Dev {
     access: Vec<AtomicU32>,
     /// rekey needs every block local: no eviction meanwhile
     evict_paused: AtomicBool,
+    pub rep: Option<Arc<crate::replica::Replicator>>,
+    /// what of the open segment the standby has: (seq, entries sent, next batch number); locked
+    /// only while `open` is held
+    rep_cursor: Mutex<(u64, usize, u32)>,
     metas: restore::MetaCache,
     queue_cv: Condvar,
     pub epoch: u64,
@@ -250,6 +258,9 @@ impl Dev {
         let p = cfg.prefix.clone();
 
         probe_readable(s3, &p).with_context(|| format!("disk {}: cannot read its log (nothing was changed)", cfg.id))?;
+        if let Some(addr) = &cfg.replica {
+            take_over_journal(s3, &p, addr, st.epoch).with_context(|| format!("disk {}", cfg.id))?;
+        }
         let epoch = claim_epoch(s3, &p)?;
 
         // Rebuild from the object store: the newest checkpoint, then the segments after it.
@@ -322,6 +333,7 @@ impl Dev {
             // an explicit file, even when every block is local: an empty file would read as all absent
             write_synced(&presence_path, &presence.to_bytes())?;
         }
+        let rep = cfg.replica.as_ref().map(|a| crate::replica::Replicator::new(a, &cfg.prefix, epoch));
         let tmp = dir.join("state.json.tmp");
         std::fs::write(&tmp, serde_json::to_vec(&LocalState { epoch })?)?;
         File::open(&tmp)?.sync_all()?;
@@ -352,6 +364,8 @@ impl Dev {
             fully_present: AtomicBool::new(presence.absent() == 0),
             lazy: Mutex::new(LazyState { file_present: true, p: presence, dirty_pages: BTreeSet::new(), reading: Default::default() }),
             access: (0..size.div_ceil(REGION)).map(|_| AtomicU32::new(0)).collect(),
+            rep,
+            rep_cursor: Mutex::new((0, 0, 0)),
             evict_paused: AtomicBool::new(false),
             presence_file: OpenOptions::new().read(true).write(true).create(true).truncate(false).open(&presence_path)?,
             metas: restore::MetaCache::default(),
@@ -804,6 +818,11 @@ impl Dev {
             return self.next_seq.load(SeqCst);
         }
         let seq = self.next_seq.fetch_add(1, SeqCst);
+        if let Some(rep) = &self.rep {
+            self.rep_send_delta(rep, &o, seq);
+            rep.seal(seq);
+            *self.rep_cursor.lock().unwrap() = (seq + 1, 0, 0);
+        }
         let seg = std::mem::take(&mut *o);
         self.open_since.store(0, SeqCst);
         let mut q = self.queue.lock().unwrap();
@@ -813,6 +832,59 @@ impl Dev {
         drop(o);
         self.queue_cv.notify_all();
         seq + 1
+    }
+
+    /// Queue for the standby what of the open segment (seq `seq`) it does not have yet. Called with
+    /// the open-segment lock held.
+    fn rep_send_delta(&self, rep: &crate::replica::Replicator, o: &Builder, seq: u64) {
+        let mut c = self.rep_cursor.lock().unwrap();
+        if c.0 != seq {
+            *c = (seq, 0, 0);
+        }
+        if o.entries.len() > c.1 {
+            let body = crate::replica::encode_delta(o, c.1);
+            match self.store.seal_blob(&crate::replica::batch_name(&self.cfg.prefix, self.epoch, seq, c.2), body) {
+                Ok(b) => {
+                    rep.append(seq, c.2, b);
+                    *c = (seq, o.entries.len(), c.2 + 1);
+                }
+                Err(e) => crate::warn!("disk {}: sealing a journal batch failed: {e:#}", self.cfg.id),
+            }
+        }
+    }
+
+    /// At a flush under `local` with a standby: queue what it lacks and a barrier. Returns the
+    /// barrier to wait for, or None when the standby is unavailable (then the flush must wait for
+    /// the object store instead).
+    pub fn rep_flush(&self) -> Option<u64> {
+        let rep = self.rep.as_ref()?;
+        let o = self.open.lock().unwrap();
+        let seq = self.next_seq.load(SeqCst);
+        self.rep_send_delta(rep, &o, seq);
+        rep.barrier()
+    }
+
+    /// After a (re)connection to the standby: the open segment in full, and the cursor at its end.
+    pub fn rep_resync(&self, emit: &mut dyn FnMut(u64, u32, Vec<u8>)) -> u64 {
+        let o = self.open.lock().unwrap();
+        let seq = self.next_seq.load(SeqCst);
+        let mut c = self.rep_cursor.lock().unwrap();
+        *c = (seq, 0, 0);
+        if !o.is_empty() {
+            let body = crate::replica::encode_delta(&o, 0);
+            if let Ok(b) = self.store.seal_blob(&crate::replica::batch_name(&self.cfg.prefix, self.epoch, seq, 0), body) {
+                emit(seq, 0, b);
+                *c = (seq, o.entries.len(), 1);
+            }
+        }
+        if let Some(rep) = &self.rep {
+            rep.go_live(seq);
+        }
+        seq
+    }
+
+    pub fn stopped_or_fenced(&self) -> bool {
+        self.stopped.load(SeqCst) || self.fenced.load(SeqCst)
     }
 
     /// Re-upload what a crashed run left behind: the data extents of each dirty region (holes become
@@ -1227,10 +1299,12 @@ impl Dev {
                     let committed = self.committed.load(SeqCst);
                     let next = q.sealed.iter().find(|s| s.seq >= q.dispatched).map(|s| (s.seq, s.seg.clone()));
                     match next {
-                        Some((seq, raw)) if seq < committed + WINDOW => {
+                        // with a standby, a segment uploads only once the standby has all of it
+                        Some((seq, raw)) if seq < committed + WINDOW && self.rep.as_ref().is_none_or(|r| r.may_upload(seq)) => {
                             q.dispatched = seq + 1;
                             break (seq, raw);
                         }
+                        _ if self.rep.is_some() => q = self.queue_cv.wait_timeout(q, std::time::Duration::from_millis(20)).unwrap().0,
                         _ => q = self.queue_cv.wait(q).unwrap(),
                     }
                 }
@@ -1258,6 +1332,9 @@ impl Dev {
                         map.apply(self.epoch, s, &front.seg.entries);
                     }
                     self.committed.store(q.commits.committed(), SeqCst);
+                    if let Some(rep) = &self.rep {
+                        rep.committed(q.commits.committed());
+                    }
                 }
             }
             PutOutcome::Exists => {
@@ -1296,6 +1373,73 @@ fn claim_epoch(s3: &dyn Store, p: &str) -> Result<u64> {
         }
         return Ok(last + 1);
     }
+}
+
+/// Upload from the standby's journal what the object store lacks of earlier epochs (a host that
+/// died with acknowledged writes not yet uploaded), before this server claims its epoch. If the
+/// standby is unreachable, continue only when this host wrote the disk last (its local image has
+/// everything, and recovery re-uploads it).
+fn take_over_journal(s3: &dyn Store, p: &str, addr: &str, local_epoch: u64) -> Result<()> {
+    let items = match crate::replica::fetch(addr, p) {
+        Ok(items) => items,
+        Err(e) => {
+            let last = s3.list(&format!("{p}/epoch/"))?.iter().filter_map(|k| log::parse_epoch_key(k)).max().unwrap_or(0);
+            if local_epoch != 0 && local_epoch == last {
+                crate::warn!("replica {addr} unreachable ({e:#}); this host wrote the disk last, continuing from its local image");
+                return Ok(());
+            }
+            bail!("replica {addr} unreachable: {e:#}. The last acknowledged writes may be only there; remove \"replica\" from the disk to open it without them");
+        }
+    };
+    if items.is_empty() {
+        return Ok(());
+    }
+    type Batches = Vec<(u32, Vec<u8>)>;
+    let mut segs: BTreeMap<(u64, u64), (bool, Batches)> = BTreeMap::new();
+    for it in items {
+        let e = segs.entry((it.epoch, it.seq)).or_insert((it.sealed, Vec::new()));
+        e.0 |= it.sealed;
+        e.1.push((it.n, it.body));
+    }
+    let epochs: BTreeSet<u64> = segs.keys().map(|(e, _)| *e).collect();
+    let mut uploaded = 0;
+    for &e in &epochs {
+        let objs: std::collections::BTreeMap<u64, bool> = s3
+            .list_sized(&format!("{p}/seg/{e:010}/"))?
+            .into_iter()
+            .filter_map(|(k, size)| log::parse_seg_key(&k).map(|(_, s)| (s, size as usize == log::TOMB.len())))
+            .collect();
+        if log::is_sealed(&objs) {
+            continue; // a later writer fenced this epoch already
+        }
+        let store_max = objs.keys().next_back().copied();
+        let journal_max = segs.range((e, 0)..=(e, u64::MAX)).map(|((_, s), _)| *s).max().unwrap_or(0);
+        for ((_, seq), (sealed, batches)) in segs.range((e, 0)..=(e, u64::MAX)) {
+            if objs.contains_key(seq) {
+                continue;
+            }
+            // an unsealed segment ends at the last acknowledged flush: usable only as the very last
+            if !sealed && !(*seq == journal_max && store_max.is_none_or(|m| m < *seq)) {
+                continue;
+            }
+            let mut b = Builder::default();
+            for (n, body) in batches {
+                let plain = s3.open_blob(&crate::replica::batch_name(p, e, *seq, *n), body.clone())?;
+                crate::replica::apply_delta(&mut b, &plain)?;
+            }
+            if b.is_empty() {
+                continue;
+            }
+            // `committed` 0: a rebuilt segment attests nothing about the rest of the log
+            s3.put_new(&log::key_seg(p, e, *seq), &segment::encode(e, *seq, 0, &b))?;
+            uploaded += 1;
+        }
+    }
+    if uploaded > 0 {
+        crate::info!("{p}: uploaded {uploaded} segments from the replica's journal");
+    }
+    crate::replica::drop_below(addr, p, epochs.iter().max().copied().unwrap_or(0) + 1)?;
+    Ok(())
 }
 
 /// Before claiming an epoch (which fences whoever serves the disk now), check that this server can

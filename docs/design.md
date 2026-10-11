@@ -377,6 +377,37 @@ off for such a disk.
 e2e case `25_cache_eviction` and CI torture jobs with 16 and 32 MiB budgets (working sets of
 64 MiB and more) cover it.
 
+### 3.5d Standby replication
+
+With `"replica": "host:port"` on a disk, a standby (`blockgw replica --listen ADDR --dir DIR`) keeps
+the writes that are acknowledged but not yet in the object store. Under `local`, a flush then
+returns once the standby has them, so losing the primary host loses no acknowledged write; the
+flush costs a LAN round trip and an fsync on the standby instead of an object-store upload.
+
+- **The standby is a dumb journal.** Per disk prefix it appends what it receives, fsyncs on a
+  barrier and acknowledges. It never talks to the object store and holds no key: on an encrypted
+  disk every batch is sealed with the disk key (bound to its place in the log) before it is sent.
+- **What is sent, and when.** Only at two points, both under the open-segment lock, so the journal
+  follows the log's order: at a flush, the part of the open segment the standby lacks plus a
+  barrier; when a segment is sealed, the rest of it plus a SEAL marker.
+- **Invariant**: a sealed segment is handed to the uploader only after the standby acknowledged its
+  SEAL. So whenever segment N+1 is in the object store, the standby holds all of N, and a takeover
+  can never combine a partial N with a later segment.
+- **Standby unavailable**: the primary degrades. Flushes wait for the object store (as under
+  `remote`) and uploads stop waiting for the standby. On reconnecting it sends SYNC, which drops
+  every journal segment without a SEAL (it may have holes), and the open segment in full. Until the
+  segments sealed while degraded are committed, a flush still waits for the object store.
+- **Takeover**: before claiming its epoch, a server opening the disk fetches the journal, rebuilds
+  each sealed segment the store lacks and uploads it create-only (`committed` 0: it attests
+  nothing), plus an unsealed last segment if the store holds nothing after it (it ends at the last
+  acknowledged flush). Then the standby drops those epochs, and refuses them from then on (a fenced
+  writer cannot write its epoch back). If the standby is unreachable, opening fails, unless this
+  host wrote the disk last (its local image has everything).
+- e2e case `26_replica` (uploads blocked, primary host lost, new host restores the fsynced data;
+  standby down → fsync falls back) and the takeover torture in `--replica` mode, where every
+  takeover loses the old host (killed, local image deleted) and every fsync-acknowledged write must
+  survive under `local`. Wiping the journal before each takeover makes that check fail at once.
+
 ### 3.6 Write-intent regions
 
 - A bit per 4 MiB region, stored in `<dir>/intent`.
@@ -489,7 +520,8 @@ The torture test runs in CI with `--encrypt` as well (remote policy), and e2e ca
 
 ## 6. Not implemented yet
 
-2. Standby replication of unflushed writes.
+1. Automatic failover between standbys (a disk has one standby; the platform picks it).
+2. Zero-copy ublk (Linux 6.15+).
 
 ## 7. Alternatives considered
 

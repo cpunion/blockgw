@@ -238,6 +238,16 @@ impl Store for CryptStore {
         self.inner.delete(key)
     }
 
+    fn seal_blob(&self, name: &str, body: Vec<u8>) -> Result<Vec<u8>> {
+        self.seal(name, &body)
+    }
+
+    fn open_blob(&self, name: &str, blob: Vec<u8>) -> Result<Vec<u8>> {
+        let hdr = Self::parse_header(name, &blob)?;
+        ensure!(blob.len() as u64 == sealed_len(hdr_plain_len(&hdr)), "{name}: sealed blob has the wrong size");
+        Ok(self.open_chunks(name, &hdr, 0, &blob[HEADER..], None)?.0)
+    }
+
     fn needs_old_key(&self, key: &str) -> Result<bool> {
         self.get_range(key, 0, 1)?;
         Ok(self.headers.lock().unwrap().get(key).is_some_and(|(_, k)| *k > 0))

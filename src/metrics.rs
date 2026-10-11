@@ -123,9 +123,18 @@ pub fn serve(addr: &str, snapshot: impl Fn() -> Snapshot + Send + 'static) -> an
     let listener = TcpListener::bind(addr)?;
     std::thread::Builder::new().name("metrics".into()).spawn(move || {
         for mut conn in listener.incoming().flatten() {
-            let mut buf = [0u8; 1024];
-            let n = conn.read(&mut buf).unwrap_or(0);
-            let req = String::from_utf8_lossy(&buf[..n]);
+            let _ = conn.set_read_timeout(Some(std::time::Duration::from_secs(2)));
+            // read the whole request head: closing with unread bytes makes the kernel send a reset,
+            // which can discard the end of the response at the client
+            let mut buf = Vec::new();
+            let mut chunk = [0u8; 1024];
+            while !buf.windows(4).any(|w| w == b"\r\n\r\n") && buf.len() < 16 << 10 {
+                match conn.read(&mut chunk) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                }
+            }
+            let req = String::from_utf8_lossy(&buf);
             let (status, body) = if req.starts_with("GET /metrics") {
                 ("200 OK", render_prometheus(&snapshot()))
             } else {
@@ -136,6 +145,8 @@ pub fn serve(addr: &str, snapshot: impl Fn() -> Snapshot + Send + 'static) -> an
                 "HTTP/1.1 {status}\r\nContent-Type: text/plain; version=0.0.4\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                 body.len()
             );
+            let _ = conn.shutdown(std::net::Shutdown::Write);
+            while matches!(conn.read(&mut chunk), Ok(n) if n > 0) {}
         }
     })?;
     Ok(())

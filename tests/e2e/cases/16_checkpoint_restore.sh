@@ -5,7 +5,7 @@ start_server "$cfg"
 id=$(cfg_ids "$cfg")
 for i in $(seq 1 20); do
   head -c $((8 << 20)) /dev/urandom > "$W/region.bin"
-  dd if="$W/region.bin" of="/dev/ublkb$id" bs=1M oflag=direct,sync status=none conv=notrunc
+  dd if="$W/region.bin" of="$(blkdev $id)" bs=1M oflag=direct,sync status=none conv=notrunc
 done
 out=$(ctl "$cfg" drain "$id"); log "note: $out"
 echo "$out" | grep -qE "checkpointed|checkpoint current" || fail "drain did not checkpoint"

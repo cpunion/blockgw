@@ -109,6 +109,7 @@ jobs:
           - { name: "XFS, local policy, 32 MiB cache", slug: fs-cache, script: fstorture.py, args: --policy local --cache-mb 32 }
           - { name: "takeovers, local policy", slug: fence-local, script: fencetorture.py, args: --policy local }
           - { name: "takeovers, remote policy", slug: fence-remote, script: fencetorture.py, args: --policy remote }
+          - { name: "host loss with a standby, local policy", slug: replica, script: fencetorture.py, args: --policy local --replica }
     steps:
       - uses: actions/checkout@v5
       - name: Install dependencies and load ublk

@@ -4,7 +4,7 @@
 cfg=$(write_config a 1 2 remote)   # remote: every fsync'd write is committed when dd returns
 start_server "$cfg"; id=$(cfg_ids "$cfg")
 for i in 1 2 3 4 5 6; do
-  dd if=/dev/urandom of="/dev/ublkb$id" bs=1M count=4 seek=$((i * 8)) oflag=direct conv=fsync status=none
+  dd if=/dev/urandom of="$(blkdev $id)" bs=1M count=4 seek=$((i * 8)) oflag=direct conv=fsync status=none
 done
 kill9_all "$cfg"
 segs=$(find "$W/store" -path '*/seg/*' -type f -size +4c | sort)
