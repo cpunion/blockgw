@@ -105,6 +105,8 @@ jobs:
           - { name: "remote, encrypted", slug: remote-encrypted, script: torture.py, args: --policy remote --encrypt }
           - { name: "XFS, local policy", slug: fs-local, script: fstorture.py, args: --policy local }
           - { name: "XFS, remote policy", slug: fs-remote, script: fstorture.py, args: --policy remote }
+          - { name: "takeovers, local policy", slug: fence-local, script: fencetorture.py, args: --policy local }
+          - { name: "takeovers, remote policy", slug: fence-remote, script: fencetorture.py, args: --policy remote }
     steps:
       - uses: actions/checkout@v5
       - name: Install dependencies and load ublk

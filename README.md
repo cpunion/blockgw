@@ -156,7 +156,7 @@ On macOS or Windows, run blockgw in a Linux VM; see [docs/local-dev.md](docs/loc
 
 - `cargo test`: unit tests for the segment format, replay and fencing rules, write-intent tracking
   and in-order commit.
-- `sudo tests/e2e/run.sh`: nineteen end-to-end cases against real ublk devices, with a local
+- `sudo tests/e2e/run.sh`: twenty-one end-to-end cases against real ublk devices, with a local
   SeaweedFS or (`E2E_STORE=dir`) a local-directory store (crash recovery, supervisor restart, orphan
   timeout, graceful drain, restore, fencing, policy switch, discard, multi-disk, idle requests,
   metrics, checkpoint restore, garbage collection, lazy restore, encryption, ...).
@@ -166,6 +166,8 @@ On macOS or Windows, run blockgw in a Linux VM; see [docs/local-dev.md](docs/loc
   acknowledged.
 - `sudo tests/torture/fstorture.py`: the same faults under XFS with a file workload; every copy must
   mount and pass `xfs_repair -n`, and under `remote` every fsynced file must be intact.
+- `sudo tests/torture/fencetorture.py`: repeated takeovers by a second server while the old one
+  keeps taking writes; the new owner must hold an exact prefix, the old one must be fenced.
 - `bench/bench.sh`: the benchmark behind the numbers above.
 
 See [docs/testing.md](docs/testing.md).
@@ -176,7 +178,7 @@ See [docs/testing.md](docs/testing.md).
 2. Key rotation for encrypted disks.
 3. Bounded local cache: evict cold, already-uploaded blocks so a host keeps only a working set
    (lazy restore already fetches blocks on first read).
-4. Zero-copy ublk (Linux 6.15+); fencing races under torture; long-running soak tests.
+4. Zero-copy ublk (Linux 6.15+); long-running soak tests.
 5. Native macOS and Windows frontends (research: an iSCSI target for Windows' built-in initiator;
    an FSKit-served image file attached with `hdiutil` on macOS).
 

@@ -71,6 +71,7 @@ CI runs the unit layer and the end-to-end suite on every pull request
 | `18_lazy_restore` | a lazy restore serves the device at once with >20,000 blocks absent; a read-only mount reads the small files on demand (identical tree) while the big file stays absent; the big file is read across a worker kill; the whole device equals the source; with hydration on, nothing is left absent, the presence file goes away and the image file equals the source |
 | `19_encryption` | with `key_file`, no object in the store contains a plaintext marker or a segment/checkpoint header; a fresh host with the key restores the tree; a wrong key and no key both fail to open the disk with a clear error; `check-config` refuses a world-readable key file |
 | `20_missing_segment` | (dir store) a committed segment in the middle of the log is deleted: a restore fails with "log incomplete" naming it instead of serving a partial disk; with the segment back, the restore works |
+| `21_lazy_crash_order` | after a lazy restore, with uploads held back by a failpoint, a write to a never-fetched block and a later write to a fetched block both survive a worker kill, and reach the store |
 
 Failpoints (`src/failpoint.rs`) let a case make the server fail at a named place:
 
@@ -174,6 +175,30 @@ refuses a log that breaks off at a gap ("log incomplete").
 The checker was validated against a deliberately wrong setup: a disk configured `local` but checked
 as `remote` fails check 3 within 30 s (fsynced files missing from a copy).
 
+## Takeover torture
+
+`tests/torture/fencetorture.py` exercises fencing the way a replacement host would trigger it. A
+single writer issues O_DIRECT writes with random fsyncs; every 2–5 s a second server opens the same
+disk from the store (a lazy restore) while the old one is still running. The old server keeps
+receiving writes until they fail (split brain), its worker is killed at random, and 10% of uploads
+fail. Write ids are globally unique, so a write from a dropped lineage is recognised.
+
+At every takeover:
+
+1. The new owner's disk is the state after exactly the first K writes of the history so far.
+2. Under `remote`, K covers every write the old owner acknowledged with an fsync before the
+   takeover began.
+3. The old owner is fenced: its writes start failing with EIO (typically within milliseconds of
+   its next upload), and none of the writes it took after the takeover appear in the new owner.
+
+At the end, the last owner holds its whole history and a fresh restore equals it. A 45 s run makes
+10–13 takeovers.
+
+Its first run found a lazy-restore bug: after a worker crash, recovery re-uploaded only blocks the
+(stale) presence bitmap marked present, dropping writes to blocks that had never been fetched while
+keeping later ones. See §3.5b of the design; e2e case `21_lazy_crash_order` reproduces it
+deterministically.
+
 ## In CI
 
 Each pull request runs the torture tests for 90 s each, with the run id as seed, so every run
@@ -187,6 +212,8 @@ explores a different schedule:
 | remote, encrypted | `torture.py --policy remote --encrypt` |
 | XFS, local policy | `fstorture.py --policy local` |
 | XFS, remote policy | `fstorture.py --policy remote` |
+| takeovers, local policy | `fencetorture.py --policy local` |
+| takeovers, remote policy | `fencetorture.py --policy remote` |
 
 ## Benchmark
 
@@ -210,7 +237,6 @@ Results land in `$BENCH_DIR/results/bench.tsv`. The October 2026 numbers are in
 
 - xfstests / fsstress on top of blockgw (the filesystem torture uses its own workload; Debian and
   Ubuntu do not package fsstress).
-- Fencing races under torture (two servers on one disk while faults are injected).
 - Object stores other than SeaweedFS (in CI) and AWS S3 (benchmarks). Aliyun OSS's
   `x-oss-forbid-overwrite` path is untested.
 - Long-running soak tests and memory-growth tracking.

@@ -308,12 +308,20 @@ with 110 MiB of data. Each 4 KiB block is then *absent* (the map points at a seg
   data never overwrites a newer local write, even when the two race.
 - **Crash safety of the bitmap.** It must never claim a block present whose data is not durable in
   the image. A flush takes a snapshot of the dirty bitmap pages *before* fdatasyncing the image,
-  then writes and syncs the snapshot, and only then acknowledges the flush. A crash can only leave
-  bits stale-absent: for a fetched block that costs a refetch; for a block written after the last
-  flush, the write was never acknowledged as durable and the block reads as its last committed
-  version (which includes the write if its segment was already uploaded).
-- **Recovery** after a crash re-uploads only present blocks of dirty regions; absent blocks are
-  still in the store under their old location.
+  then writes and syncs the snapshot, and only then acknowledges the flush. A crash can therefore
+  leave bits stale-absent, never stale-present: a block written (or fetched) since the last flush
+  may be marked absent although its data is in the image.
+- **Recovery** after a crash must not trust the bitmap for that reason. Treating a stale-absent
+  written block as absent would drop that write while a later write to a present block is
+  re-uploaded: a state the disk was never in. So, within dirty regions, recovery reads the image:
+  - a data extent is never older than the block's committed version (it was fetched from it, or
+    written since), so it is re-uploaded and marked present;
+  - a hole that is present is uploaded as a discard;
+  - a hole that is absent was never fetched, and its data is still in the store. This is
+    unambiguous because a discard over absent blocks writes zeros to them instead of punching.
+  The bitmap update is persisted after an image fdatasync, as at flush. e2e case
+  `21_lazy_crash_order` and the takeover torture cover this; an earlier version that re-uploaded
+  only present blocks failed both.
 - **Repack** copies only runs whose blocks are all present (it reads them from the image).
 - **Failures.** A fetch that fails is planned again from the current map (a local write may have
   superseded the block and GC deleted its old segment), up to 3 times; then the read fails with
