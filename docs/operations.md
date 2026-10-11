@@ -1,0 +1,73 @@
+# Operations
+
+## Running as a service
+
+[examples/blockgw.service](../examples/blockgw.service) is a systemd unit:
+
+- **Before starting** it loads `ublk_drv` and validates the config (`blockgw check-config`).
+- **Supervision**: `blockgw serve` restarts a crashed worker within about 200 ms. If no worker can
+  serve the disks within `--orphan-timeout`, it stops them, so I/O fails with EIO instead of hanging,
+  and exits 1. systemd then restarts the service.
+- **Stopping**: `SIGTERM` drains every disk's upload queue, then exits. The devices stay attached and
+  are re-attached by the next start, so an upgrade is: install the new binary, then
+  `systemctl restart blockgw`. Consumers see a stall, not an error.
+- **Moving a disk** to another host: unmount, `blockgw ctl SOCK drain <id>`, stop the service, and
+  start a server with the same `prefix` on the new host.
+- **Removing a disk**: unmount, then `blockgw del <id>`, and remove it from the config.
+
+## Control socket
+
+`blockgw ctl <control_socket> <command>`:
+
+| Command | Effect |
+|---|---|
+| `stats` / `stats json` | per-disk counters, as text or JSON |
+| `metrics` | the same Prometheus text the HTTP endpoint serves |
+| `policy <id> local\|remote` | switch the durability policy at runtime |
+| `lag <id> <MiB>` | change the upload lag limit for the `local` policy |
+| `drain <id>` | seal the open segment and wait until everything is committed |
+
+## Metrics
+
+Set `"metrics_addr": "127.0.0.1:9187"` in the config to serve Prometheus metrics at `GET /metrics`.
+Per-disk series carry a `disk` label.
+
+| Metric | Type | Meaning |
+|---|---|---|
+| `blockgw_info{version}` | gauge | build version |
+| `blockgw_process_resident_memory_bytes` | gauge | worker RSS |
+| `blockgw_epoch` | gauge | epoch the server writes the disk under |
+| `blockgw_policy_remote` | gauge | 1 = `remote`, 0 = `local` |
+| `blockgw_fenced` | gauge | 1 once a newer writer took the disk over |
+| `blockgw_committed_segments` | gauge | segments committed in this epoch |
+| `blockgw_upload_lag_bytes` | gauge | sealed bytes not yet committed: the loss window under `local` |
+| `blockgw_open_segment_bytes` | gauge | bytes written since the last seal |
+| `blockgw_max_lag_bytes` | gauge | configured lag limit |
+| `blockgw_puts_total`, `blockgw_put_bytes_total`, `blockgw_raw_bytes_total` | counter | uploads; object bytes after compression; segment bytes before it |
+| `blockgw_upload_errors_total` | counter | failed upload attempts (they are retried) |
+| `blockgw_upload_seconds_total` | counter | time in successful uploads |
+| `blockgw_flushes_total` | counter | flushes handled |
+| `blockgw_flush_wait_seconds_total` | counter | time flushes waited for uploads (`remote`, or lag backpressure) |
+| `blockgw_intent_syncs_total` | counter | write-intent bitmap fdatasyncs |
+| `blockgw_lag_waits_total` | counter | times writers or flushes waited for the lag to shrink |
+
+Suggested alerts:
+
+| Condition | Meaning |
+|---|---|
+| `blockgw_fenced == 1` | another host owns the disk; this server must give it up |
+| `blockgw_upload_lag_bytes > blockgw_max_lag_bytes` for more than a few minutes | uploads are not keeping up, and the loss window is growing |
+| `rate(blockgw_upload_errors_total[5m]) > 0` for a while | the object store is unreachable or rejecting writes |
+| `rate(blockgw_flush_wait_seconds_total[5m]) / rate(blockgw_flushes_total[5m])` rising | fsync latency is rising: `remote` policy, or backpressure |
+| supervisor log lines `worker exited` or `orphan timeout` | the worker is crashing |
+
+## Logs
+
+Logs go to stderr as `2026-10-11T13:00:00.123Z INFO disk 3: ...`. Set the level with
+`BLOCKGW_LOG=error|warn|info|debug` (default `info`).
+
+| Level | Lines |
+|---|---|
+| `info` | disk open, recovery, ready, drain |
+| `warn` | upload retries, supervisor restarts |
+| `error` | `FENCED`, failed disk threads |

@@ -15,6 +15,8 @@
 mod dev;
 mod failpoint;
 mod log;
+mod logx;
+mod metrics;
 mod s3;
 mod store;
 mod supervise;
@@ -40,6 +42,8 @@ struct Config {
     s3: Option<s3::S3Config>,
     /// ...or a local directory (development, tests, or a second disk / NAS mount)
     local_store: Option<String>,
+    /// optional "host:port" for a Prometheus `GET /metrics` endpoint
+    metrics_addr: Option<String>,
     control_socket: String,
     devices: Vec<DevConfig>,
     upload_workers: Option<usize>,
@@ -68,6 +72,15 @@ fn main() -> Result<()> {
             std::process::exit(supervise::supervise(path, &ids, std::time::Duration::from_secs(timeout))?)
         }
         Some("worker") => worker(args.get(2).context("missing CONFIG")?),
+        Some("check-config") => {
+            let cfg = load_config(args.get(2).context("missing CONFIG")?)?;
+            println!("ok: {} disk(s), store: {}", cfg.devices.len(), if cfg.s3.is_some() { "s3" } else { "local directory" });
+            Ok(())
+        }
+        Some("--version" | "version") => {
+            println!("blockgw {}", env!("CARGO_PKG_VERSION"));
+            Ok(())
+        }
         Some("ctl") => ctl(&args[2], &args[3..].join(" ")),
         Some("del") => {
             // STOP first (a DEL while the server holds the device deadlocks), then delete asynchronously
@@ -77,7 +90,9 @@ fn main() -> Result<()> {
             Ok(())
         }
         _ => {
-            eprintln!("usage: blockgw serve CONFIG [--orphan-timeout SECS] [--no-supervisor] | ctl SOCKET CMD... | del ID");
+            eprintln!(
+                "usage: blockgw serve CONFIG [--orphan-timeout SECS] [--no-supervisor] | check-config CONFIG | ctl SOCKET CMD... | del ID | --version"
+            );
             std::process::exit(2)
         }
     }
@@ -132,6 +147,11 @@ fn worker(path: &str) -> Result<()> {
             let _ = handle_ctl(s, &ctl_devs);
         }
     });
+    if let Some(addr) = &cfg.metrics_addr {
+        let mdevs = devs.clone();
+        metrics::serve(addr, move || snapshot(&mdevs)).with_context(|| format!("metrics listener on {addr}"))?;
+        info!("metrics on http://{addr}/metrics");
+    }
     // SIGTERM: drain every disk's upload queue, then exit; the devices stay recoverable
     let term_devs = devs.clone();
     std::thread::Builder::new().name("term".into()).spawn(move || {
@@ -144,7 +164,7 @@ fn worker(path: &str) -> Result<()> {
             while d.committed.load(SeqCst) < need && !d.fenced.load(SeqCst) && t0.elapsed().as_secs() < 60 {
                 std::thread::sleep(std::time::Duration::from_millis(10));
             }
-            eprintln!("disk {}: drained to seq {} on shutdown", d.cfg.id, d.committed.load(SeqCst));
+            info!("disk {}: drained to seq {} on shutdown", d.cfg.id, d.committed.load(SeqCst));
         }
         std::process::exit(0);
     })?;
@@ -154,7 +174,7 @@ fn worker(path: &str) -> Result<()> {
     }
     for h in handles {
         if let Ok(Err(e)) = h.join() {
-            eprintln!("disk thread failed: {e:#}");
+            error!("disk thread failed: {e:#}");
         }
     }
     Ok(())
@@ -164,7 +184,7 @@ fn run_disk(d: Arc<Dev>) -> Result<()> {
     let id = d.cfg.id;
     let recover = matches!(supervise::attach_mode(id)?, supervise::Attach::Recover);
     if recover {
-        eprintln!("disk {id}: re-attaching the existing device");
+        info!("disk {id}: re-attaching the existing device");
         UblkCtrl::new_simple(id)?.start_user_recover()?;
     }
     let ctrl = libublk::ctrl::UblkCtrlBuilder::default()
@@ -196,7 +216,7 @@ fn run_disk(d: Arc<Dev>) -> Result<()> {
         tgt_init,
         move |qid, dev: &_| queue_fn(qid, dev, dq.clone()),
         move |c: &UblkCtrl| {
-            eprintln!("disk {id}: /dev/ublkb{} ready", c.dev_info().dev_id);
+            info!("disk {id}: /dev/ublkb{} ready", c.dev_info().dev_id);
         },
     )?;
     Ok(())
@@ -211,7 +231,7 @@ fn queue_fn(qid: u16, dev: &UblkDev, d: Arc<Dev>) {
         tasks.push(exe.spawn(async move {
             match io_task(&q, tag, &d).await {
                 Err(UblkError::QueueIsDown) | Ok(_) => {}
-                Err(e) => eprintln!("io task {tag}: {e}"),
+                Err(e) => error!("io task {tag}: {e}"),
             }
         }));
     }
@@ -220,7 +240,7 @@ fn queue_fn(qid: u16, dev: &UblkDev, d: Arc<Dev>) {
         let run = || while e2.try_tick() {};
         let done = || tasks.iter().all(|t| t.is_finished());
         if let Err(e) = libublk::wait_and_handle_io_events(&q, Some(20), run, done).await {
-            eprintln!("queue loop: {e}");
+            error!("queue loop: {e}");
         }
     }));
 }
@@ -254,12 +274,14 @@ async fn flush(d: &Dev) -> i32 {
     }
     d.stats.flushes.fetch_add(1, Relaxed);
     let need = d.seal();
+    let t0 = std::time::Instant::now();
     if d.policy.load(SeqCst) == POLICY_REMOTE {
         wait_efd(|fd| d.wait_committed(need, fd)).await;
     } else if d.queued_bytes() > d.max_lag.load(SeqCst) {
         d.stats.lag_waits.fetch_add(1, Relaxed);
         wait_efd(|fd| d.wait_lag_below(d.max_lag.load(SeqCst), fd)).await;
     }
+    d.stats.flush_wait_micros.fetch_add(t0.elapsed().as_micros() as u64, Relaxed);
     if d.fenced.load(SeqCst) {
         -libc::EIO
     } else {
@@ -310,6 +332,10 @@ async fn handle(_q: &UblkQueue<'_>, tag: u16, d: &Dev, io: &mut [u8]) -> i32 {
     }
 }
 
+fn snapshot(devs: &[Arc<Dev>]) -> metrics::Snapshot {
+    metrics::Snapshot { version: env!("CARGO_PKG_VERSION"), rss_bytes: rss_kb() * 1024, disks: devs.iter().map(|d| d.snapshot()).collect() }
+}
+
 fn rss_kb() -> u64 {
     std::fs::read_to_string("/proc/self/status")
         .ok()
@@ -350,18 +376,19 @@ fn handle_ctl(s: UnixStream, devs: &[Arc<Dev>]) -> Result<()> {
             None => "error: no such disk".into(),
         },
         ["stats"] => {
-            let mut v = vec![format!("rss_kb {}", rss_kb())];
-            for d in devs {
-                let s = &d.stats;
+            let s = snapshot(devs);
+            let mut v = vec![format!("rss_kb {}", s.rss_bytes / 1024)];
+            for d in &s.disks {
                 v.push(format!(
-                    "disk {} epoch={} policy={} fenced={} committed_seq={} queued_bytes={} open_bytes={} puts={} put_bytes={} raw_bytes={} flushes={} intent_syncs={} lag_waits={}",
-                    d.cfg.id, d.epoch, if d.policy.load(SeqCst) == POLICY_REMOTE { "remote" } else { "local" },
-                    d.fenced.load(SeqCst), d.committed.load(SeqCst), d.queued_bytes(), d.open_bytes(),
-                    s.puts.load(Relaxed), s.put_bytes.load(Relaxed), s.raw_bytes.load(Relaxed), s.flushes.load(Relaxed),
-                    s.intent_syncs.load(Relaxed), s.lag_waits.load(Relaxed)));
+                    "disk {} epoch={} policy={} fenced={} committed_seq={} queued_bytes={} open_bytes={} puts={} put_bytes={} raw_bytes={} upload_errors={} flushes={} intent_syncs={} lag_waits={}",
+                    d.id, d.epoch, d.policy, d.fenced, d.committed_seq, d.queued_bytes, d.open_bytes, d.puts, d.put_bytes, d.raw_bytes,
+                    d.upload_errors, d.flushes, d.intent_syncs, d.lag_waits
+                ));
             }
             v.join("\n")
         }
+        ["stats", "json"] => serde_json::to_string(&snapshot(devs))?,
+        ["metrics"] => metrics::render_prometheus(&snapshot(devs)).trim_end().to_string(),
         _ => "error: unknown command".into(),
     };
     writeln!(w, "{out}")?;

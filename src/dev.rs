@@ -93,6 +93,9 @@ pub struct Stats {
     pub flushes: AtomicU64,
     pub intent_syncs: AtomicU64,
     pub lag_waits: AtomicU64,
+    pub upload_errors: AtomicU64,
+    pub upload_micros: AtomicU64,
+    pub flush_wait_micros: AtomicU64,
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Default)]
@@ -177,7 +180,7 @@ impl Dev {
         std::fs::write(&tmp, serde_json::to_vec(&LocalState { epoch })?)?;
         File::open(&tmp)?.sync_all()?;
         std::fs::rename(&tmp, dir.join("state.json"))?;
-        eprintln!(
+        crate::info!(
             "disk {}: epoch {epoch} (local was {}), fresh={fresh}, applied {applied} foreign segments, {} dirty regions to re-upload",
             cfg.id,
             st.epoch,
@@ -203,6 +206,29 @@ impl Dev {
             fenced: AtomicBool::new(false),
             stats: Stats::default(),
         })
+    }
+
+    pub fn snapshot(&self) -> crate::metrics::DiskSnapshot {
+        let s = &self.stats;
+        crate::metrics::DiskSnapshot {
+            id: self.cfg.id,
+            epoch: self.epoch,
+            policy: if self.policy.load(SeqCst) == POLICY_REMOTE { "remote" } else { "local" },
+            fenced: self.fenced.load(SeqCst),
+            committed_seq: self.committed.load(SeqCst),
+            queued_bytes: self.queued_bytes(),
+            open_bytes: self.open_bytes(),
+            max_lag_bytes: self.max_lag.load(SeqCst),
+            puts: s.puts.load(Relaxed),
+            put_bytes: s.put_bytes.load(Relaxed),
+            raw_bytes: s.raw_bytes.load(Relaxed),
+            upload_errors: s.upload_errors.load(Relaxed),
+            upload_seconds: s.upload_micros.load(Relaxed) as f64 / 1e6,
+            flushes: s.flushes.load(Relaxed),
+            flush_wait_seconds: s.flush_wait_micros.load(Relaxed) as f64 / 1e6,
+            intent_syncs: s.intent_syncs.load(Relaxed),
+            lag_waits: s.lag_waits.load(Relaxed),
+        }
     }
 
     fn image_path(&self) -> PathBuf {
@@ -326,7 +352,7 @@ impl Dev {
             q = self.queue_cv.wait(q).unwrap();
         }
         drop(q);
-        eprintln!(
+        crate::info!(
             "disk {}: recovery re-uploaded {} regions ({} MiB data, {holes} holes) in {} ms",
             self.cfg.id,
             regions.len(),
@@ -423,9 +449,10 @@ impl Dev {
             }
             PutOutcome::Exists => {
                 if !self.fenced.swap(true, SeqCst) {
-                    eprintln!(
+                    crate::error!(
                         "disk {}: FENCED: segment {seq} of epoch {} already exists (a newer writer took over); failing all I/O",
-                        self.cfg.id, self.epoch
+                        self.cfg.id,
+                        self.epoch
                     );
                 }
             }
@@ -492,19 +519,24 @@ impl Pool {
                 j.pop_front().unwrap()
             };
             if let Err(e) = crate::failpoint::hit("upload") {
-                eprintln!("disk {}: {e}", dev.cfg.id);
+                crate::warn!("disk {}: {e}", dev.cfg.id);
             }
             let obj = log::to_object(&raw);
             let key = log::key_seg(&dev.cfg.prefix, dev.epoch, seq);
             let mut backoff = 100;
+            let t0 = Instant::now();
             let outcome = loop {
                 if dev.fenced.load(SeqCst) {
                     break PutOutcome::Exists;
                 }
                 match s3.put_new(&key, &obj) {
-                    Ok(o) => break o,
+                    Ok(o) => {
+                        dev.stats.upload_micros.fetch_add(t0.elapsed().as_micros() as u64, Relaxed);
+                        break o;
+                    }
                     Err(e) => {
-                        eprintln!("disk {}: upload {key} failed, retrying: {e:#}", dev.cfg.id);
+                        dev.stats.upload_errors.fetch_add(1, Relaxed);
+                        crate::warn!("disk {}: upload {key} failed, retrying: {e:#}", dev.cfg.id);
                         std::thread::sleep(std::time::Duration::from_millis(backoff));
                         backoff = (backoff * 2).min(5000);
                     }
