@@ -491,6 +491,9 @@ impl Pool {
                 }
                 j.pop_front().unwrap()
             };
+            if let Err(e) = crate::failpoint::hit("upload") {
+                eprintln!("disk {}: {e}", dev.cfg.id);
+            }
             let obj = log::to_object(&raw);
             let key = log::key_seg(&dev.cfg.prefix, dev.epoch, seq);
             let mut backoff = 100;

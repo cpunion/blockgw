@@ -48,11 +48,23 @@ CI runs the unit layer and the end-to-end suite on every pull request
 | `08_multi_disk` | four disks in one process with concurrent writers; content stays isolated; RSS reported and bounded |
 | `09_idle_no_requests` | idle mounted disks issue no PUTs over 20 s |
 | `10_recovery_is_bounded` | regression: after `mkfs` (a full-device discard) and an idle period, a crash leaves fewer than 4 dirty regions, not the whole disk |
+| `11_supervisor_restart` | `kill -9` of the worker during an O_DIRECT write: the supervisor restarts it, the device is re-attached, the writer sees no error, and the object store converges |
+| `12_orphan_timeout` | a failpoint makes every restart exit: after the orphan timeout (3 s in the test), I/O fails with EIO rather than hanging, the block device is gone, and the supervisor exits |
+| `13_sigterm_drains` | with uploads slowed by a failpoint, `SIGTERM` drains the backlog (about 50 MB) before exit; a restore shows the object store holds everything |
+| `14_no_supervisor_auto_attach` | without the supervisor, a plain restart after `kill -9` re-attaches the existing device; data intact, writes work |
+
+Failpoints (`src/failpoint.rs`) let a case make the server fail at a named place:
+
+- `BLOCKGW_FAILPOINTS="name=action,..."`, or a file named by `BLOCKGW_FAILPOINTS_FILE`, which every
+  new worker re-reads.
+- Actions are `exit`, `panic`, `error` and `sleep:<ms>`.
+- The current points are `open`, hit before each disk is opened, and `upload`, hit before each
+  segment PUT.
 
 Writing a case:
 
 - The file is sourced with `tests/e2e/lib.sh` loaded. Use `write_config`, `start_server`,
-  `kill9_server`, `ctl`, `stat`, `mkfs_mount`, `gen_tree`, `tree_hash`, `assert_eq` and friends.
+  `kill9_worker` (the supervisor restarts it), `kill9_all`, `ctl`, `stat`, `mkfs_mount`, `gen_tree`, `tree_hash`, `assert_eq` and friends.
 - Exit 0 to pass, 77 (`skip`) to skip; anything else fails the case.
 - Set `DISK_KEYS=a-d0` before `write_config` to address an existing disk from a second server, as a
   restore or takeover does.

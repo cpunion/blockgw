@@ -45,7 +45,9 @@ PY
 serve(){ (MALLOC_ARENA_MAX=${MALLOC_ARENA_MAX:-2} setsid nohup "$BLOCKGW" serve "$B/c.json" "$@" >> $R/serve.log 2>&1 &); }
 wait_dev(){ for i in $(seq 1 600); do [ -b /dev/ublkb$1 ] && return 0; sleep 0.05; done; return 1; }
 stop_all(){ for m in $(grep -oE " /m[0-9]+ " /proc/mounts); do umount $m 2>/dev/null; done
-  for d in /dev/ublkb*; do [ -b "$d" ] && $BLOCKGW del ${d#/dev/ublkb} >/dev/null 2>&1; done; sleep 1; pkill -f "^$BLOCKGW serve"; sleep 1; rm -rf $B/disks; }
+  for id in $(bench_ids); do [ -e "/sys/class/ublk-char/ublkc$id" ] && "$BLOCKGW" del "$id" >/dev/null 2>&1; done; sleep 1; pkill -f "^$BLOCKGW (serve|worker) $B/"; sleep 1; rm -rf $B/disks; }
+# ids of the devices this benchmark created (only those are ever deleted)
+bench_ids(){ for f in "$B/c.json" "$B/r.json"; do [ -f "$f" ] && python3 -c "import json,sys;print(' '.join(str(d['id']) for d in json.load(open(sys.argv[1]))['devices']))" "$f"; done; }
 fsync_lat(){ python3 - "$1" "${2:-50}" <<'PY'
 import os, sys, time
 d, n = sys.argv[1], int(sys.argv[2]); v = []
@@ -141,13 +143,14 @@ phase_KILL(){
   dd if=/dev/urandom of=$B/rand.bin bs=1M count=500 status=none
   ( dd if=$B/rand.bin of=/m0/big.bin bs=1M oflag=direct status=none; echo $? > /tmp/dd.rc ) &
   local dp=$!; sleep 2; local before; before=$($CTL stats | grep "disk 0" | grep -oE "uploaded_seq=[0-9]+ queued_bytes=[0-9]+ open_bytes=[0-9]+")
-  local t=$(now); kill -9 $(pgrep -f "^$BLOCKGW serve"); : > $R/serve.log; serve --recover; for i in $(seq 1 1200); do grep -q "ublkb0 ready" $R/serve.log 2>/dev/null && break; sleep 0.05; done
+  # crash the worker; the supervisor restarts it and the new worker re-attaches the device
+  local t=$(now); : > $R/serve.log; kill -9 $(pgrep -f "^$BLOCKGW worker $B/"); for i in $(seq 1 1200); do grep -q "ublkb0 ready" $R/serve.log 2>/dev/null && break; sleep 0.05; done
   local rt=$(ms $t); wait $dp
   rec KILL dd500 recover "killed during O_DIRECT write ($before); new process serving after ${rt}ms; dd rc=$(cat /tmp/dd.rc); $(grep -E 'dirty regions|recovery' $R/serve.log | sed 's/^disk 0: //' | tr '\n' ';')"
   cmp -s $B/rand.bin /m0/big.bin && rec KILL dd500 content identical || rec KILL dd500 content DIFFERS
   rec KILL dd500 kernel_errors "$(dmesg | grep -ciE 'error|shutdown')"
   rm -rf /m0/ts; ( git clone -q file://$MIRROR /m0/ts; echo $? > /tmp/cl.rc ) & local cp=$!; sleep 3
-  t=$(now); kill -9 $(pgrep -f "^$BLOCKGW serve"); serve --recover; sleep 0.5; wait $cp; rec KILL clone recover "clone rc=$(cat /tmp/cl.rc) after kill -9 mid-clone; fsck rc=$(git -C /m0/ts fsck --no-progress >/dev/null 2>&1; echo $?); kernel errors $(dmesg | grep -ciE 'error|shutdown')"
+  t=$(now); kill -9 $(pgrep -f "^$BLOCKGW worker $B/"); sleep 0.5; wait $cp; rec KILL clone recover "clone rc=$(cat /tmp/cl.rc) after kill -9 mid-clone; fsck rc=$(git -C /m0/ts fsck --no-progress >/dev/null 2>&1; echo $?); kernel errors $(dmesg | grep -ciE 'error|shutdown')"
 }
 phase_RESTORE(){
   umount /m0; $CTL drain 0 >/dev/null; local a; a=$(sha256sum $B/disks/d0/data | cut -c1-16)   # umount writes too: drain after it
@@ -165,5 +168,7 @@ PY
   mount -o noatime,nouuid /dev/ublkb0 /m0; echo x > /m0/after.txt; sync -f /m0 2>/dev/null; local src=$?; sleep 1
   rec RESTORE old-writer fenced "sync rc=$src; $($CTL stats | grep 'disk 0' | grep -oE 'fenced=[a-z]+')"
 }
+# never leave devices behind: a ublk device whose server is gone blocks every global `sync` on the host
+trap 'stop_all >/dev/null 2>&1' EXIT
 for ph in ${PHASES:-KERNEL SINGLE POLICY MULTI IDLE KILL RESTORE}; do echo "=== $ph $(date -u +%T)"; phase_$ph; done
 echo "=== done $(date -u +%T)"

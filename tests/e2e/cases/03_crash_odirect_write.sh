@@ -10,7 +10,7 @@ mark_dmesg
 dp=$!
 sleep 1
 log "note: before kill: $(ctl "$cfg" stats | grep "^disk $id" | grep -oE 'committed_seq=[0-9]+ queued_bytes=[0-9]+ open_bytes=[0-9]+')"
-t0=$(now_ms); kill9_server "$cfg"; start_server "$cfg" --recover
+t0=$(now_ms); kill9_all "$cfg"; start_server "$cfg"
 log "metric: serving again after $(( $(now_ms) - t0 )) ms; $(last_start_log "$cfg" | grep -oE 'recovery re-uploaded.*|[0-9]+ dirty regions' | tr '\n' ' ')"
 wait $dp
 assert_eq "$(cat "$W/dd.rc")" 0 "dd exit status"

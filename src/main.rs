@@ -1,9 +1,10 @@
 //! blockgw: one process serves every virtual disk on this host through ublk; each disk lives in a
 //! local sparse image and persists as a log of segments in S3-compatible object storage.
 //!
-//!   blockgw serve CONFIG.json [--recover]   add (or, after a crash, re-attach) every configured disk
+//!   blockgw serve CONFIG.json [--orphan-timeout SECS] [--no-supervisor]
+//!       serve every configured disk; devices left by a crashed server are re-attached, others added
 //!   blockgw ctl SOCKET <command...>          policy <id> local|remote | lag <id> <MiB> | drain <id> | stats
-//!   blockgw del <ublk-id>                    delete a ublk device
+//!   blockgw del <ublk-id>                    stop and delete a ublk device
 //!
 //! Data path per I/O (queue thread, io_uring shared with the ublk queue):
 //!   READ  -> read from the local sparse data file (O_DIRECT)
@@ -12,8 +13,10 @@
 //!   DISCARD / WRITE_ZEROES -> punch hole -> record in open segment
 
 mod dev;
+mod failpoint;
 mod log;
 mod s3;
+mod supervise;
 mod track;
 
 use anyhow::{Context, Result};
@@ -43,24 +46,60 @@ const IO_BUF: u32 = 256 << 10;
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
     match args.get(1).map(String::as_str) {
-        Some("serve") => serve(&args[2], args.iter().any(|a| a == "--recover")),
+        Some("serve") => {
+            let path = args.get(2).context("missing CONFIG")?;
+            if args.iter().any(|a| a == "--no-supervisor") {
+                return worker(path);
+            }
+            let timeout = args
+                .iter()
+                .position(|a| a == "--orphan-timeout")
+                .and_then(|i| args.get(i + 1))
+                .map(|s| s.parse::<u64>())
+                .transpose()
+                .context("--orphan-timeout takes seconds")?
+                .unwrap_or(30);
+            let cfg = load_config(path)?;
+            let ids: Vec<i32> = cfg.devices.iter().map(|d| d.id).collect();
+            std::process::exit(supervise::supervise(path, &ids, std::time::Duration::from_secs(timeout))?)
+        }
+        Some("worker") => worker(args.get(2).context("missing CONFIG")?),
         Some("ctl") => ctl(&args[2], &args[3..].join(" ")),
         Some("del") => {
-            // STOP first: DEL while the serving process still holds the char device deadlocks
-            let c = UblkCtrl::new_simple(args[2].parse()?)?;
-            let _ = c.kill_dev();
-            c.del_dev()?;
+            // STOP first (a DEL while the server holds the device deadlocks), then delete asynchronously
+            let id: i32 = args.get(2).context("missing ID")?.parse()?;
+            UblkCtrl::new_simple(id).context("no such ublk device")?;
+            supervise::fail_device(id);
             Ok(())
         }
         _ => {
-            eprintln!("usage: blockgw serve CONFIG [--recover] | ctl SOCKET CMD... | del ID");
+            eprintln!("usage: blockgw serve CONFIG [--orphan-timeout SECS] [--no-supervisor] | ctl SOCKET CMD... | del ID");
             std::process::exit(2)
         }
     }
 }
 
-fn serve(path: &str, recover: bool) -> Result<()> {
-    let cfg: Config = serde_json::from_slice(&std::fs::read(path)?).context("config")?;
+fn load_config(path: &str) -> Result<Config> {
+    let cfg: Config = serde_json::from_slice(&std::fs::read(path).with_context(|| format!("read {path}"))?).context("parse config")?;
+    let mut ids = std::collections::HashSet::new();
+    for d in &cfg.devices {
+        anyhow::ensure!(ids.insert(d.id), "device id {} appears twice", d.id);
+        anyhow::ensure!(d.id >= 0, "device id {} must be >= 0", d.id);
+        anyhow::ensure!(d.size_gb > 0, "device {}: size_gb must be > 0", d.id);
+        anyhow::ensure!(
+            !d.prefix.is_empty() && !d.prefix.ends_with('/'),
+            "device {}: prefix must be non-empty without a trailing '/'",
+            d.id
+        );
+        anyhow::ensure!(d.policy == "local" || d.policy == "remote", "device {}: policy must be local or remote", d.id);
+    }
+    Ok(cfg)
+}
+
+/// The worker: opens every disk, re-uploads what a crashed run left behind, and serves the devices.
+fn worker(path: &str) -> Result<()> {
+    let cfg = load_config(path)?;
+    supervise::install_term_handler();
     let s3 = Arc::new(s3::S3::new(&cfg.s3)?);
     let pool = dev::Pool::new();
     for i in 0..cfg.upload_workers.unwrap_or(16) {
@@ -69,6 +108,7 @@ fn serve(path: &str, recover: bool) -> Result<()> {
     }
     let mut devs = Vec::new();
     for dc in cfg.devices.clone() {
+        failpoint::hit("open")?;
         let d = Arc::new(Dev::open(dc, &s3)?);
         let (d2, p2) = (d.clone(), pool.clone());
         std::thread::Builder::new().name(format!("disp-{}", d.cfg.id)).spawn(move || d2.dispatcher(&p2))?;
@@ -83,9 +123,25 @@ fn serve(path: &str, recover: bool) -> Result<()> {
             let _ = handle_ctl(s, &ctl_devs);
         }
     });
+    // SIGTERM: drain every disk's upload queue, then exit; the devices stay recoverable
+    let term_devs = devs.clone();
+    std::thread::Builder::new().name("term".into()).spawn(move || {
+        while !supervise::term_requested() {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        for d in &term_devs {
+            let need = d.seal();
+            let t0 = std::time::Instant::now();
+            while d.committed.load(SeqCst) < need && !d.fenced.load(SeqCst) && t0.elapsed().as_secs() < 60 {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            eprintln!("disk {}: drained to seq {} on shutdown", d.cfg.id, d.committed.load(SeqCst));
+        }
+        std::process::exit(0);
+    })?;
     let mut handles = Vec::new();
     for d in devs {
-        handles.push(std::thread::Builder::new().name(format!("ublk-{}", d.cfg.id)).spawn(move || run_disk(d, recover))?);
+        handles.push(std::thread::Builder::new().name(format!("ublk-{}", d.cfg.id)).spawn(move || run_disk(d))?);
     }
     for h in handles {
         if let Ok(Err(e)) = h.join() {
@@ -95,9 +151,11 @@ fn serve(path: &str, recover: bool) -> Result<()> {
     Ok(())
 }
 
-fn run_disk(d: Arc<Dev>, recover: bool) -> Result<()> {
+fn run_disk(d: Arc<Dev>) -> Result<()> {
     let id = d.cfg.id;
+    let recover = matches!(supervise::attach_mode(id)?, supervise::Attach::Recover);
     if recover {
+        eprintln!("disk {id}: re-attaching the existing device");
         UblkCtrl::new_simple(id)?.start_user_recover()?;
     }
     let ctrl = libublk::ctrl::UblkCtrlBuilder::default()
