@@ -349,6 +349,34 @@ The torture test reads every restored copy through the device, so each crash-con
 exercises on-demand fetching; e2e case `18_lazy_restore` covers reads across a worker crash and
 hydration to completion.
 
+### 3.5c Bounded local cache
+
+With `cache_mb` set, a disk keeps at most that much of its data in the local image; the rest lives
+only in the object store and is fetched when read (the lazy-restore path). Background hydration is
+off for such a disk.
+
+- **What may be dropped**: a 4 MiB region whose write-intent bit is clear and which has no write in
+  flight, so every write into it is committed and the object store holds exactly what the image
+  holds; and only blocks the extent map points at (unmapped blocks read as zeros anyway).
+- **Order**: least recently read or written regions first, every second, until the image is at 90%
+  of the budget (allocated blocks of the image file).
+- **Races**, each closed by a lock the evictor holds while it drops a region:
+  - the open-segment lock: GC repack and rekey copy blocks from the image under it, and re-check
+    under it that the blocks are still present;
+  - the regions lock: no write can start in the region;
+  - the lazy lock: no fetch can fill a block, and no read can start. Reads register the region
+    before checking presence and unregister after reading the image; the evictor skips regions with
+    reads in flight, so a read that found its blocks present finds them still there.
+- **Crash safety**: the image is fdatasync'd, the blocks are marked absent and the bitmap pages are
+  written and synced, and only then is the hole punched. The bitmap may claim a block absent whose
+  data is still there (a refetch), never present when it was punched.
+- The presence file now always exists with every bit explicit. Before, an eager (`lazy: false`)
+  restore removed it and the next open created an empty one, which reads as "everything absent":
+  a restart then refetched the whole disk (correctly, but needlessly).
+
+e2e case `25_cache_eviction` and CI torture jobs with 16 and 32 MiB budgets (working sets of
+64 MiB and more) cover it.
+
 ### 3.6 Write-intent regions
 
 - A bit per 4 MiB region, stored in `<dir>/intent`.
@@ -461,8 +489,6 @@ The torture test runs in CI with `--encrypt` as well (remote policy), and e2e ca
 
 ## 6. Not implemented yet
 
-1. A bounded local cache: lazy restore fetches on first read and hydrates in the background, but
-   a host still ends up holding the full image; evicting cold, uploaded blocks is not done.
 2. Standby replication of unflushed writes.
 
 ## 7. Alternatives considered

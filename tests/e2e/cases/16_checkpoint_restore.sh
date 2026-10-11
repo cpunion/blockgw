@@ -18,3 +18,7 @@ echo "$line" | grep -q "/ckpt/" || fail "restore did not use a checkpoint"
 live=$(echo "$line" | grep -oE '[0-9]+ MiB of live data' | grep -oE '^[0-9]+')
 assert_lt "$live" 12 "live data fetched (8 MiB written last, out of $((raw >> 20)) MiB uploaded)"
 assert_eq "$(dev_hash "$(cfg_ids "$r")")" "$(file_hash "$(image a 0)")" "restored image"
+# an eager restore leaves an explicit presence file: a restart finds every block local
+kill9_all "$r"; start_server "$r"
+last_start_log "$r" | grep -q "; 0 blocks absent" || fail "after a restart the restored disk has absent blocks: $(last_start_log "$r" | grep -o 'blocks absent.*\|[0-9]* blocks absent' | head -1)"
+

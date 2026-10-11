@@ -34,6 +34,11 @@ impl RegionTracker {
         self.last_seq.len()
     }
 
+    /// Everything written into region `r` is committed and nothing is in flight.
+    pub fn clean(&self, r: usize) -> bool {
+        self.bits[r / 64] >> (r % 64) & 1 == 0 && self.inflight[r] == 0
+    }
+
     /// A write into regions `a..=b` starts. Returns true if a bit was newly set, i.e. the caller must
     /// persist `to_bytes()` before letting the write proceed.
     pub fn begin(&mut self, a: u64, b: u64) -> bool {
@@ -116,6 +121,18 @@ impl CommitTracker {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn clean_needs_no_bit_and_nothing_in_flight() {
+        let mut t = RegionTracker::new(4, &[]);
+        assert!(t.clean(1));
+        t.begin(1, 1);
+        assert!(!t.clean(1) && t.clean(2));
+        t.end(1, 1, Some(5));
+        assert!(!t.clean(1), "written but not committed");
+        t.clear_committed(6);
+        assert!(t.clean(1));
+    }
 
     #[test]
     fn first_write_into_a_region_needs_persisting() {

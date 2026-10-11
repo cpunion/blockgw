@@ -30,6 +30,8 @@ pub struct DiskSnapshot {
     pub absent_blocks: u64,
     pub fetched_bytes: u64,
     pub fetch_errors: u64,
+    pub cached_bytes: u64,
+    pub evicted_bytes: u64,
 }
 
 #[derive(serde::Serialize, Clone, Debug)]
@@ -109,6 +111,10 @@ pub fn render_prometheus(s: &Snapshot) -> String {
         x.fetched_bytes.to_string()
     });
     family(&mut o, "blockgw_fetch_errors_total", "counter", "Failed fetch attempts.", d, |x| x.fetch_errors.to_string());
+    family(&mut o, "blockgw_cached_bytes", "gauge", "Bytes of the disk's data held in the local image.", d, |x| x.cached_bytes.to_string());
+    family(&mut o, "blockgw_evicted_bytes_total", "counter", "Bytes dropped from the local image to stay within cache_mb.", d, |x| {
+        x.evicted_bytes.to_string()
+    });
     o
 }
 

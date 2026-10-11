@@ -1,6 +1,6 @@
 # Lazy restore: the device is served at once and blocks are fetched from the object store when
 # first read; a crash mid-way keeps everything correct; background hydration then fetches the rest
-# and removes the presence file.
+# and nothing is left absent.
 cfg=$(write_config a 1 2)
 start_server "$cfg"
 id=$(cfg_ids "$cfg")
@@ -36,6 +36,5 @@ for _ in $(seq 1 300); do
   [ "$a" = 0 ] && break; sleep 0.1
 done
 assert_eq "$a" 0 "absent blocks after hydration"
-drain "$r" "$rid"   # a flush persists the presence state; once complete the file goes away
-for _ in $(seq 1 50); do [ -e "$W/r/d0/presence" ] || break; sleep 0.1; done
+drain "$r" "$rid"   # a flush persists the presence state
 assert_eq "$(file_hash "$(image r 0)")" "$src" "hydrated image file"

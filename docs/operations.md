@@ -83,6 +83,8 @@ Per-disk series carry a `disk` label.
 | `blockgw_gc_repacked_bytes_total` | counter | live bytes rewritten out of sparse segments |
 | `blockgw_absent_blocks` | gauge | 4 KiB blocks not fetched yet after a lazy restore (0 = fully hydrated) |
 | `blockgw_fetched_bytes_total` | counter | bytes fetched on demand or by background hydration |
+| `blockgw_cached_bytes` | gauge | bytes of the disk's data in the local image |
+| `blockgw_evicted_bytes_total` | counter | bytes dropped to stay within `cache_mb` |
 | `blockgw_fetch_errors_total` | counter | failed fetch attempts (a read fails with EIO after retries) |
 
 Suggested alerts:
@@ -102,6 +104,7 @@ Suggested alerts:
 |---|---|---|
 | `policy` | `local` | durability policy at start (switchable at runtime) |
 | `max_lag_mb` | 16 | upload lag allowed under `local` before writers wait |
+| `cache_mb` | 0 | keep at most this much of the disk's data on the host (0 = all); cold committed regions are dropped and fetched again when read |
 | `seal_interval_ms` | 1000 | seal the open segment once its oldest write is this old; under `local` flushes do not seal, so this sets the PUT rate and adds to the loss window (0 = seal at every flush) |
 | `checkpoint_every` | 64 | committed segments between checkpoints (also every 60 s if anything committed) |
 | `checkpoint_mb` | 64 | also checkpoint after this much data written since the last checkpoint; GC keeps up to two checkpoint intervals of segments, so this bounds the store at about live data + 2 × `checkpoint_mb` plus what repack has not caught up with |
