@@ -259,9 +259,22 @@ phases are:
 Results land in `$BENCH_DIR/results/bench.tsv`. The October 2026 numbers are in
 [results/2026-10-prototype.md](results/2026-10-prototype.md).
 
+## Real object stores
+
+CI runs the e2e suite against SeaweedFS. On demand it also runs against a real store: set
+`S3_ENDPOINT`, `S3_REGION`, `S3_BUCKET`, `S3_ACCESS_KEY` and `S3_SECRET_KEY`.
+
+- **Cloudflare R2** (October 2026, from a host far from the region): all 22 cases pass
+  (`20_missing_segment` is dir-store only). Create-only PUTs, ranged reads, encryption, lazy
+  restore, fencing and missing-object detection behave as on SeaweedFS. Two cases first failed
+  there and led to changes: recovery no longer waits for its upload before re-attaching (the
+  worker took longer than the orphan timeout), and `22_local_batching` counts sealed segments
+  after a drain rather than completed PUTs.
+- **AWS S3**: the prototype benchmarks (`docs/results/2026-10-prototype.md`).
+
 ## Not covered yet
 
 - xfstests / fsstress on top of blockgw (the filesystem torture uses its own workload; Debian and
   Ubuntu do not package fsstress).
-- Object stores other than SeaweedFS (in CI) and AWS S3 (benchmarks). Aliyun OSS's
-  `x-oss-forbid-overwrite` path is untested.
+- Object stores other than SeaweedFS (in CI), Cloudflare R2 (e2e on demand) and AWS S3
+  (benchmarks). Aliyun OSS's `x-oss-forbid-overwrite` path is untested.

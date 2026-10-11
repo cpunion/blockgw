@@ -623,7 +623,8 @@ impl Dev {
     }
 
     /// Re-upload what a crashed run left behind: the data extents of each dirty region (holes become
-    /// discards, found with SEEK_DATA/SEEK_HOLE). Runs before the device is attached.
+    /// discards, found with SEEK_DATA/SEEK_HOLE). Builds the segment before the device is attached;
+    /// the upload proceeds in the background, ahead of every later segment.
     ///
     /// Everything goes into a single segment. Uploaded piecewise, a host lost halfway through would
     /// leave a log whose prefix mixes regions at the crash-time state with regions at an older state,
@@ -717,17 +718,17 @@ impl Dev {
                 self.fully_present.store(true, Release);
             }
         }
-        let need = self.seal();
+        // The segment had to be built before the device is attached (new writes must not change the
+        // image under it), but it need not be uploaded yet: it is sealed first, so every later
+        // segment commits after it, and the intent bits stay set until it commits. Waiting for the
+        // upload here would hold the device for as long as the dirty data takes to upload, past
+        // the supervisor's orphan timeout on a slow link.
+        self.seal();
         for range in ranges {
             self.intent_end(range, Some(seq));
         }
-        let mut q = self.queue.lock().unwrap();
-        while self.committed.load(SeqCst) < need && !self.fenced.load(SeqCst) {
-            q = self.queue_cv.wait(q).unwrap();
-        }
-        drop(q);
         crate::info!(
-            "disk {}: recovery re-uploaded {} regions ({} MiB data, {holes} holes) as one segment in {} ms",
+            "disk {}: recovery queued {} regions ({} MiB data, {holes} holes) as one segment in {} ms",
             self.cfg.id,
             regions.len(),
             data_bytes >> 20,

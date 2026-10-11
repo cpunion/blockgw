@@ -254,8 +254,12 @@ With `lazy` (the default), a rebuild does not download any data up front: see 3.
 The map is always rebuilt from the object store at open, never trusted from a local file that a
 crash may have left half-written.
 
-Then, if intent bits are set (an earlier crash), the server re-uploads those regions before the
-device is attached:
+Then, if intent bits are set (an earlier crash), the server re-uploads those regions. The segment
+is built before the device is attached, so no new write changes the image under it; its upload
+then proceeds in the background. It is sealed first, so every later segment commits after it, and
+the intent bits stay set until it commits. Waiting for the upload would hold the device for as long
+as the dirty data takes to upload: against Cloudflare R2 over a home uplink, that exceeded the
+30 s orphan timeout and failed I/O; now the disk is served again within 9 s there.
 
 - only data extents are read (`SEEK_DATA` / `SEEK_HOLE`); holes become discards;
 - everything goes into **one segment**, committed atomically.
@@ -389,7 +393,7 @@ The torture test runs in CI with `--encrypt` as well (remote policy), and e2e ca
 
 | Failure | What the consumer sees | Handling |
 |---|---|---|
-| Worker process crashes | I/O stalls (ublk user recovery), no errors | The supervisor restarts the worker at once; the worker re-uploads the dirty regions, then re-attaches |
+| Worker process crashes | I/O stalls (ublk user recovery), no errors | The supervisor restarts the worker at once; the worker queues the dirty regions for re-upload as one segment, then re-attaches |
 | No worker comes back within `--orphan-timeout` (default 30 s) | I/O fails with `EIO`; the filesystem shuts down | The supervisor stops the devices, deletes them asynchronously (the kernel finishes once the filesystem is unmounted), and exits with status 1 |
 | The whole service is killed (supervisor and worker) | I/O stalls until the service is started again | A new `serve` re-attaches every device that is waiting for a server |
 | `SIGTERM` | nothing; the devices stay recoverable | The worker drains every disk's upload queue (bounded at 60 s per disk), then exits |
