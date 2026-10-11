@@ -181,7 +181,12 @@ Then, if intent bits are set (an earlier crash), the server re-uploads those reg
 device is attached:
 
 - only data extents are read (`SEEK_DATA` / `SEEK_HOLE`); holes become discards;
-- the upload queue is bounded at 64 MiB while this runs.
+- everything goes into **one segment**, committed atomically.
+  - If the re-upload were split, a host lost partway through would leave a log prefix that mixes
+    regions at their crash-time state with regions at an older state, which is not a state the disk
+    was ever in. The torture test exercises this.
+  - The segment's size is the dirty data, which write-intent tracking keeps close to the upload lag
+    at the time of the crash.
 
 ### 3.6 Write-intent regions
 

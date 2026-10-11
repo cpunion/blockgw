@@ -151,6 +151,9 @@ On macOS or Windows, run blockgw in a Linux VM; see [docs/local-dev.md](docs/loc
   SeaweedFS or (`E2E_STORE=dir`) a local-directory store (crash recovery, supervisor restart, orphan
   timeout, graceful drain, restore, fencing, policy switch, discard, multi-disk, idle requests,
   metrics, ...).
+- `sudo tests/torture/torture.py`: crash-consistency torture. Random worker kills, random upload
+  failures and store copies taken at random instants; every copy must restore to an exact prefix
+  of the writes, with nothing lost that `remote` acknowledged.
 - `bench/bench.sh`: the benchmark behind the numbers above.
 
 See [docs/testing.md](docs/testing.md).
@@ -162,7 +165,7 @@ See [docs/testing.md](docs/testing.md).
 2. Checkpoints of the extent map, plus garbage collection and repacking of dead segments.
 3. Encryption at rest (per-disk keys).
 4. Optional streaming of unflushed writes to a standby.
-5. Zero-copy ublk (Linux 6.15+) and a systematic crash-consistency test matrix.
+5. Zero-copy ublk (Linux 6.15+); concurrent-writer and filesystem-level (fsstress) torture.
 6. Native macOS and Windows frontends (research: an iSCSI target for Windows' built-in initiator;
    an FSKit-served image file attached with `hdiutil` on macOS).
 
