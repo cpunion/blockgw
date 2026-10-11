@@ -211,6 +211,76 @@ fn fetch_segment_runs(store: &dyn Store, key: &str, e: u64, s: u64, runs: &[(u32
     Ok(written)
 }
 
+/// Metas of recently read segments (lazy reads hit the same segments over and over).
+#[derive(Default)]
+pub struct MetaCache {
+    m: std::sync::Mutex<std::collections::HashMap<(u64, u64), std::sync::Arc<segment::Meta>>>,
+}
+
+impl MetaCache {
+    pub fn get(&self, store: &dyn Store, prefix: &str, e: u64, s: u64) -> Result<std::sync::Arc<segment::Meta>> {
+        if let Some(m) = self.m.lock().unwrap().get(&(e, s)) {
+            return Ok(m.clone());
+        }
+        let key = log::key_seg(prefix, e, s);
+        let meta = std::sync::Arc::new(fetch_meta(store, &key)?.with_context(|| format!("{key}: referenced but is a tombstone"))?);
+        check_position(&meta, e, s, &key)?;
+        let mut m = self.m.lock().unwrap();
+        if m.len() >= 4096 {
+            m.clear();
+        }
+        m.insert((e, s), meta.clone());
+        Ok(meta)
+    }
+}
+
+/// Fetch the committed contents of individual blocks: `wanted` holds `(disk block, (epoch, seq),
+/// data block)`. Returns `(disk block, 4 KiB)` pairs. Frames are fetched per segment with
+/// `frame_spans` and decoded once.
+pub fn fetch_blocks(store: &dyn Store, prefix: &str, metas: &MetaCache, wanted: &[(u64, (u64, u64), u32)]) -> Result<Vec<(u64, Vec<u8>)>> {
+    let mut by_seg: BTreeMap<(u64, u64), Vec<(u32, u64)>> = BTreeMap::new();
+    for &(b, seg, d) in wanted {
+        by_seg.entry(seg).or_default().push((d, b));
+    }
+    let mut out = Vec::with_capacity(wanted.len());
+    for ((e, s), mut blocks) in by_seg {
+        blocks.sort_unstable();
+        let key = log::key_seg(prefix, e, s);
+        let meta = metas.get(store, prefix, e, s).with_context(|| format!("{key}: segment meta"))?;
+        let mut needed: Vec<usize> = blocks.iter().flat_map(|&(d, _)| meta.frames_for(d as u64 * BLOCK, BLOCK)).collect();
+        needed.sort_unstable();
+        needed.dedup();
+        let mut raw: std::collections::HashMap<usize, Vec<u8>> = std::collections::HashMap::new();
+        for span in frame_spans(&needed, meta.frames.len(), MERGE_GAP_FRAMES) {
+            let (off, len) = segment::frames_span(&meta, &span);
+            let bytes = store.get_range(&key, off, len).with_context(|| format!("{key}: ranged read of {len} bytes at {off}"))?;
+            ensure!(bytes.len() as u64 == len, "{key}: short ranged read");
+            for f in span {
+                if needed.binary_search(&f).is_ok() {
+                    let fr = &meta.frames[f];
+                    let at = (fr.obj_off - off) as usize;
+                    raw.insert(f, segment::decode_frame(fr, &bytes[at..at + fr.obj_len as usize])?);
+                }
+            }
+        }
+        let fs = meta.frame_size as u64;
+        for (d, b) in blocks {
+            let (mut off, end) = (d as u64 * BLOCK, (d as u64 + 1) * BLOCK);
+            let mut data = Vec::with_capacity(BLOCK as usize);
+            while off < end {
+                let f = (off / fs) as usize;
+                let frame = raw.get(&f).with_context(|| format!("{key}: frame {f} not fetched"))?;
+                let at = (off - f as u64 * fs) as usize;
+                let take = ((end - off) as usize).min(frame.len() - at);
+                data.extend_from_slice(&frame[at..at + take]);
+                off += take as u64;
+            }
+            out.push((b, data));
+        }
+    }
+    Ok(out)
+}
+
 /// Apply a whole segment object to the image and the map.
 fn apply_object(obj: &[u8], e: u64, s: u64, key: &str, image: &File, map: &mut ExtentMap) -> Result<()> {
     let (meta, data) = segment::decode_all(obj).with_context(|| key.to_string())?;

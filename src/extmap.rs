@@ -42,6 +42,10 @@ impl ExtentMap {
         Ok(ExtentMap { map, blocks, segs: vec![(0, 0)], data_blocks: vec![0], by_id: HashMap::new() })
     }
 
+    pub fn blocks(&self) -> u64 {
+        self.blocks
+    }
+
     fn entry(&self, b: u64) -> u64 {
         let p = b as usize * 8;
         u64::from_le_bytes(self.map[p..p + 8].try_into().unwrap())

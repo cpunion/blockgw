@@ -33,6 +33,7 @@ CI runs the unit layer and the end-to-end suite on every pull request
 | `src/logx.rs` | RFC 3339 UTC timestamps (including a leap day and 2099), level parsing and ordering |
 | `src/failpoint.rs` | failpoint spec parsing; malformed entries ignored |
 | `src/gc.rs` | deletion only of unreferenced data segments below the older checkpoint (tombstones and newer segments kept); keeping the last two checkpoints; repack candidates by live ratio, age and budget |
+| `src/presence.rs` | presence bitmap round trip (padding bits ignored); a fetch never lands on a block being written or already written; a failed write leaves the block absent; next-absent scan across words |
 | `src/track.rs` | a region needs persisting on first write only; bits clear only after the last write's segment is committed and nothing is in flight; failed writes do not pin a region; overlapping writes keep the latest segment; bitmap round trip (padding bits ignored); commit of out-of-order completions only as a contiguous prefix |
 
 ## End-to-end suite
@@ -66,6 +67,7 @@ CI runs the unit layer and the end-to-end suite on every pull request
 | `15_metrics_and_ops` | `/metrics` serves every family and returns 404 for other paths; `puts_total` grows with writes; lag is 0 after a drain; `ctl metrics` matches HTTP; `stats json` parses; `check-config` accepts a valid config and rejects duplicate ids; `--version`; log lines are timestamped and leveled |
 | `16_checkpoint_restore` | 20 overwrites of the same 8 MiB: drain writes a checkpoint; a restore uses it and fetches about 8 MiB of live data out of about 160 MiB uploaded; image identical |
 | `17_gc` | three rounds of overwrites, each followed by `ctl gc`: GC deletes dead segments; segments left in the store = uploaded − deleted; a restore after GC is byte-identical |
+| `18_lazy_restore` | a lazy restore serves the device at once with >20,000 blocks absent; a read-only mount reads the small files on demand (identical tree) while the big file stays absent; the big file is read across a worker kill; the whole device equals the source; with hydration on, nothing is left absent, the presence file goes away and the image file equals the source |
 
 Failpoints (`src/failpoint.rs`) let a case make the server fail at a named place:
 
@@ -118,7 +120,8 @@ Checks:
 1. **No write is lost across worker crashes**: the device ends with the last version of every block.
 2. **Every copy restores to a crash-consistent image**, with no torn block. Because writes are
    issued one at a time, the restored image must equal the state after exactly the first K writes,
-   for some K.
+   for some K. The copy is read through the restored device, so lazy on-demand fetching is part
+   of every check.
 3. **Under `remote`**, K covers every write acknowledged by an fsync that returned before the copy
    started.
 

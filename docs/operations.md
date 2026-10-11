@@ -53,6 +53,9 @@ Per-disk series carry a `disk` label.
 | `blockgw_lag_waits_total` | counter | times writers or flushes waited for the lag to shrink |
 | `blockgw_gc_deleted_segments_total`, `blockgw_gc_deleted_bytes_total` | counter | segment objects, and their bytes, deleted by GC |
 | `blockgw_gc_repacked_bytes_total` | counter | live bytes rewritten out of sparse segments |
+| `blockgw_absent_blocks` | gauge | 4 KiB blocks not fetched yet after a lazy restore (0 = fully hydrated) |
+| `blockgw_fetched_bytes_total` | counter | bytes fetched on demand or by background hydration |
+| `blockgw_fetch_errors_total` | counter | failed fetch attempts (a read fails with EIO after retries) |
 
 Suggested alerts:
 
@@ -61,6 +64,7 @@ Suggested alerts:
 | `blockgw_fenced == 1` | another host owns the disk; this server must give it up |
 | `blockgw_upload_lag_bytes > blockgw_max_lag_bytes` for more than a few minutes | uploads are not keeping up, and the loss window is growing |
 | `rate(blockgw_upload_errors_total[5m]) > 0` for a while | the object store is unreachable or rejecting writes |
+| `rate(blockgw_fetch_errors_total[5m]) > 0` | lazy reads are failing: the store is unreachable, or objects are missing |
 | `rate(blockgw_flush_wait_seconds_total[5m]) / rate(blockgw_flushes_total[5m])` rising | fsync latency is rising: `remote` policy, or backpressure |
 | supervisor log lines `worker exited` or `orphan timeout` | the worker is crashing |
 
@@ -74,6 +78,8 @@ Suggested alerts:
 | `gc` | `true` | run garbage collection after each checkpoint |
 | `repack_ratio` | 0.5 | repack segments whose live fraction is below this |
 | `repack_budget_mb` | 64 | live data rewritten per GC round |
+| `lazy` | `true` | on restore, serve the device at once and fetch blocks on first read |
+| `hydrate_mbps` | 64 | background hydration rate after a lazy restore (0 = on demand only) |
 | `depth`, `queues` | 32, 1 | ublk queue depth and number of queues |
 
 ## Logs

@@ -20,4 +20,4 @@ log "metric: image allocation ${before} KiB -> ${after} KiB after rm + fstrim"
 assert_lt "$after" $((before - 200000)) "fstrim released the file's blocks in the image"
 DISK_KEYS="a-d0" r=$(write_config r 1 4)
 start_server "$r"
-assert_eq "$(file_hash "$(image r 0)")" "$(file_hash "$(image a 0)")" "restored image after discards"
+assert_eq "$(dev_hash "$(cfg_ids "$r")")" "$(file_hash "$(image a 0)")" "restored image after discards"

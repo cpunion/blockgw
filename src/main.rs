@@ -19,6 +19,7 @@ mod gc;
 mod log;
 mod logx;
 mod metrics;
+mod presence;
 mod restore;
 mod s3;
 mod segment;
@@ -54,6 +55,9 @@ struct Config {
 }
 
 const IO_BUF: u32 = 256 << 10;
+
+/// Fetch workers for reads of absent blocks after a lazy restore.
+static FETCH: std::sync::OnceLock<Arc<dev::FetchPool>> = std::sync::OnceLock::new();
 
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
@@ -134,6 +138,11 @@ fn worker(path: &str) -> Result<()> {
         let (p, s) = (pool.clone(), s3.clone());
         std::thread::Builder::new().name(format!("put-{i}")).spawn(move || p.worker(s.as_ref()))?;
     }
+    let fetch = FETCH.get_or_init(dev::FetchPool::new).clone();
+    for i in 0..8 {
+        let f = fetch.clone();
+        std::thread::Builder::new().name(format!("fetch-{i}")).spawn(move || f.worker())?;
+    }
     let mut devs = Vec::new();
     for dc in cfg.devices.clone() {
         failpoint::hit("open")?;
@@ -143,6 +152,8 @@ fn worker(path: &str) -> Result<()> {
         d.recover()?; // before attach: the crashed run's un-uploaded tail goes first
         let d3 = d.clone();
         std::thread::Builder::new().name(format!("ckpt-{}", d.cfg.id)).spawn(move || d3.checkpointer())?;
+        let d4 = d.clone();
+        std::thread::Builder::new().name(format!("hydrate-{}", d.cfg.id)).spawn(move || d4.hydrator())?;
         devs.push(d);
     }
     let ctl_devs = devs.clone();
@@ -258,7 +269,7 @@ fn queue_fn(qid: u16, dev: &UblkDev, d: Arc<Dev>) {
     }));
 }
 
-async fn io_task(q: &UblkQueue<'_>, tag: u16, d: &Dev) -> Result<(), UblkError> {
+async fn io_task(q: &UblkQueue<'_>, tag: u16, d: &Arc<Dev>) -> Result<(), UblkError> {
     let mut buf = IoBuf::<u8>::new(q.dev.dev_info.max_io_buf_bytes as usize);
     q.submit_io_prep_cmd(tag, BufDesc::Slice(buf.as_slice()), 0, Some(&buf)).await?;
     loop {
@@ -281,9 +292,15 @@ async fn wait_efd(register: impl FnOnce(i32)) {
 }
 
 async fn flush(d: &Dev) -> i32 {
+    let presence = d.presence_snapshot(); // before the sync: see Dev::presence_snapshot
     let r = uring(opcode::Fsync::new(types::Fixed(1)).flags(types::FsyncFlags::DATASYNC).build()).await;
     if r < 0 {
         return r;
+    }
+    if let Some(pages) = presence {
+        if d.presence_persist(pages).is_err() {
+            return -libc::EIO;
+        }
     }
     d.stats.flushes.fetch_add(1, Relaxed);
     let need = d.seal();
@@ -302,7 +319,7 @@ async fn flush(d: &Dev) -> i32 {
     }
 }
 
-async fn handle(_q: &UblkQueue<'_>, tag: u16, d: &Dev, io: &mut [u8]) -> i32 {
+async fn handle(_q: &UblkQueue<'_>, tag: u16, d: &Arc<Dev>, io: &mut [u8]) -> i32 {
     if d.fenced.load(SeqCst) {
         return -libc::EIO;
     }
@@ -311,10 +328,23 @@ async fn handle(_q: &UblkQueue<'_>, tag: u16, d: &Dev, io: &mut [u8]) -> i32 {
     let off = iod.start_sector << 9;
     let bytes = iod.nr_sectors << 9;
     match op {
-        libublk::sys::UBLK_IO_OP_READ => uring(opcode::Read::new(types::Fixed(1), io.as_mut_ptr(), bytes).offset(off).build()).await,
+        libublk::sys::UBLK_IO_OP_READ => {
+            if d.has_absent(off, bytes as u64) {
+                // lazy restore: fetch the missing blocks off the queue thread, then read the image
+                let failed = Arc::new(std::sync::atomic::AtomicU64::new(0));
+                let (dd, f2) = (d.clone(), failed.clone());
+                wait_efd(|fd| FETCH.get().expect("fetch pool").submit(dd, off, bytes as u64, fd, f2)).await;
+                if failed.load(SeqCst) != 0 {
+                    return -libc::EIO;
+                }
+            }
+            uring(opcode::Read::new(types::Fixed(1), io.as_mut_ptr(), bytes).offset(off).build()).await
+        }
         libublk::sys::UBLK_IO_OP_WRITE => {
             let Ok(rg) = d.intent_begin(off, bytes as u64) else { return -libc::EIO };
+            d.write_begin(off, bytes as u64);
             let r = uring(opcode::Write::new(types::Fixed(1), io.as_ptr(), bytes).offset(off).build()).await;
+            d.write_end(off, bytes as u64, r >= 0);
             let seq = (r >= 0).then(|| d.append_data(off, &io[..bytes as usize]));
             d.intent_end(rg, seq);
             // bulk writes without FLUSH must not grow the upload queue without bound
@@ -334,10 +364,12 @@ async fn handle(_q: &UblkQueue<'_>, tag: u16, d: &Dev, io: &mut [u8]) -> i32 {
         libublk::sys::UBLK_IO_OP_FLUSH => flush(d).await,
         libublk::sys::UBLK_IO_OP_DISCARD | libublk::sys::UBLK_IO_OP_WRITE_ZEROES => {
             let Ok(rg) = d.intent_begin(off, bytes as u64) else { return -libc::EIO };
+            d.write_begin(off, bytes as u64);
             let (r, seq) = match log::punch(d.image.as_raw_fd(), off, bytes as u64) {
                 Ok(_) => (0, Some(d.append_discard(off, bytes))),
                 Err(_) => (-libc::EIO, None),
             };
+            d.write_end(off, bytes as u64, r == 0);
             d.intent_end(rg, seq);
             r
         }

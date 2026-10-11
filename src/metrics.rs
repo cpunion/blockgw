@@ -27,6 +27,9 @@ pub struct DiskSnapshot {
     pub gc_deleted_segments: u64,
     pub gc_deleted_bytes: u64,
     pub gc_repacked_bytes: u64,
+    pub absent_blocks: u64,
+    pub fetched_bytes: u64,
+    pub fetch_errors: u64,
 }
 
 #[derive(serde::Serialize, Clone, Debug)]
@@ -90,6 +93,22 @@ pub fn render_prometheus(s: &Snapshot) -> String {
     family(&mut o, "blockgw_lag_waits_total", "counter", "Times a writer or flush waited for the upload lag to shrink.", d, |x| {
         x.lag_waits.to_string()
     });
+    family(&mut o, "blockgw_gc_deleted_segments_total", "counter", "Segment objects deleted by garbage collection.", d, |x| {
+        x.gc_deleted_segments.to_string()
+    });
+    family(&mut o, "blockgw_gc_deleted_bytes_total", "counter", "Bytes of segment objects deleted by garbage collection.", d, |x| {
+        x.gc_deleted_bytes.to_string()
+    });
+    family(&mut o, "blockgw_gc_repacked_bytes_total", "counter", "Live bytes rewritten out of sparse segments.", d, |x| {
+        x.gc_repacked_bytes.to_string()
+    });
+    family(&mut o, "blockgw_absent_blocks", "gauge", "4 KiB blocks not yet fetched after a lazy restore.", d, |x| {
+        x.absent_blocks.to_string()
+    });
+    family(&mut o, "blockgw_fetched_bytes_total", "counter", "Bytes fetched on demand or by background hydration.", d, |x| {
+        x.fetched_bytes.to_string()
+    });
+    family(&mut o, "blockgw_fetch_errors_total", "counter", "Failed fetch attempts.", d, |x| x.fetch_errors.to_string());
     o
 }
 

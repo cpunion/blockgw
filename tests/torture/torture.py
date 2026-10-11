@@ -13,8 +13,9 @@ with random fsyncs. Each block it writes carries (block, global write id, checks
 Checks:
   1. no acknowledged write is lost across worker crashes: the device ends up holding, for every
      block, the last version written;
-  2. every store copy restores to a crash-consistent image: because writes are issued one at a
-     time, it must equal the state after exactly the first K writes for some K, with no torn block;
+  2. every store copy restores to a crash-consistent image (read through the restored device, so
+     lazy on-demand fetches are exercised): because writes are issued one at a time, it must equal
+     the state after exactly the first K writes for some K, with no torn block;
   3. under the `remote` policy, K covers every write acknowledged by an fsync that returned before
      the copy started.
 
@@ -69,6 +70,18 @@ class Server:
     def worker_pid(self):
         out = subprocess.run(["pgrep", "-P", str(self.proc.pid), "-f", "blockgw worker"], capture_output=True, text=True).stdout.split()
         return int(out[0]) if out else None
+
+
+def dev_node(dev_id, timeout=10):
+    """/dev/ublkbN, waiting for udev; without udev (e.g. a container's private /dev) create it."""
+    path, t0 = f"/dev/ublkb{dev_id}", time.time()
+    while not os.path.exists(path):
+        if time.time() - t0 > timeout:
+            major, minor = map(int, open(f"/sys/block/ublkb{dev_id}/dev").read().split(":"))
+            os.mknod(path, 0o600 | 0o060000, os.makedev(major, minor))  # S_IFBLK
+            break
+        time.sleep(0.05)
+    return path
 
 
 def copy_store(src, dst):
@@ -137,7 +150,7 @@ def main():
     failures = []
     try:
         srv.wait_ready(a.id)
-        fd = os.open(f"/dev/ublkb{a.id}", os.O_RDWR | os.O_DIRECT)
+        fd = os.open(dev_node(a.id), os.O_RDWR | os.O_DIRECT)
         buf = mmap.mmap(-1, BS)
         writes = []          # gid -> block (index gid-1)
         state = {"acked": 0}  # highest gid covered by a completed fsync
@@ -207,8 +220,12 @@ def main():
             r = Server(blockgw, rcfg, ["--no-supervisor"])
             try:
                 r.wait_ready(rid)
-                with open(os.path.join(rimg, "data"), "rb") as f:
-                    img = f.read(NBLOCKS * BS)
+                # read through the device: after a lazy restore this fetches blocks on demand
+                rfd = os.open(dev_node(rid), os.O_RDONLY | os.O_DIRECT)
+                try:
+                    img = b"".join(os.pread(rfd, BS * 1024, off) for off in range(0, NBLOCKS * BS, BS * 1024))
+                finally:
+                    os.close(rfd)
                 gids = [parse_block(img[b * BS:(b + 1) * BS], b) for b in range(NBLOCKS)]
                 K = max(gids)
                 expect = {}

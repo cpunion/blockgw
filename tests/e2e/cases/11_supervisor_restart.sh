@@ -19,4 +19,4 @@ grep -q "re-attaching the existing device" "${cfg%.json}.log" || fail "worker di
 umount_ok "$W/m"; drain "$cfg" "$id"
 DISK_KEYS="a-d0" r=$(write_config r 1 8)
 start_server "$r"
-assert_eq "$(file_hash "$(image r 0)")" "$(file_hash "$(image a 0)")" "object store converged"
+assert_eq "$(dev_hash "$(cfg_ids "$r")")" "$(file_hash "$(image a 0)")" "object store converged"
