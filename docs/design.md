@@ -274,6 +274,13 @@ as the dirty data takes to upload: against Cloudflare R2 over a home uplink, tha
 After each checkpoint, a GC round runs against the last two checkpoints this server knows of. The
 checkpoint the disk was opened from counts as the first.
 
+Checkpoints are written every `checkpoint_every` segments (64), every `checkpoint_mb` of data
+written by users (64 MiB), and every 60 s if anything was committed. GC keeps everything above the
+older of the last two checkpoints, so the store holds up to two checkpoint intervals of segments
+beyond the live data. With batched sealing (§3.2) segments are large, and a segment count alone let
+that grow to 12–25× the live data in the soak test; the byte limit keeps it at 2–3×. Repack copies
+do not count toward `checkpoint_mb`, or each GC round would trigger the next.
+
 1. **Ownership**: if an epoch marker newer than the server's own exists, the server marks itself
    fenced and stops. Only the current owner deletes.
 2. **Delete old checkpoints**: those older than the older of the two. This comes first: while a
