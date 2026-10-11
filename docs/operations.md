@@ -74,6 +74,7 @@ Suggested alerts:
 |---|---|---|
 | `policy` | `local` | durability policy at start (switchable at runtime) |
 | `max_lag_mb` | 16 | upload lag allowed under `local` before writers wait |
+| `seal_interval_ms` | 1000 | seal the open segment once its oldest write is this old; under `local` flushes do not seal, so this sets the PUT rate and adds to the loss window (0 = seal at every flush) |
 | `checkpoint_every` | 64 | committed segments between checkpoints (also every 60 s if anything committed) |
 | `gc` | `true` | run garbage collection after each checkpoint |
 | `repack_ratio` | 0.5 | repack segments whose live fraction is below this |

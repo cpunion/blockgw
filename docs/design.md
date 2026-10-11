@@ -81,14 +81,21 @@ classic exclusive-create primitive, but that path is untested.
 
 | Policy | Where data is when `fsync` returns | `fsync` latency (measured) | Loss if the host is lost |
 |---|---|---|---|
-| `local` | on the host's disk (image `fdatasync`) | 0.8–3 ms | the un-uploaded tail, bounded by `max_lag` |
+| `local` | on the host's disk (image `fdatasync`) | 0.8–3 ms | the un-uploaded tail: up to `seal_interval_ms` of writes not yet sealed, plus up to `max_lag` sealed but not uploaded |
 | `remote` | in the object store | about 59 ms (host about 9 ms from S3) | nothing acknowledged by `fsync` |
 
 Under both policies:
 
-- **The object store always holds a crash-consistent prefix.** Segments are cut at flush
-  boundaries, or early at 16 MiB, which is also a valid crash point. They are committed in
+- **The object store always holds a crash-consistent prefix.** A segment holds writes in arrival
+  order and can be cut anywhere: a cut between two writes is a valid crash point, because a
+  write that completed before another was issued always arrives first. Segments are committed in
   sequence order, so any committed prefix is a state the disk could have crashed into.
+- **When segments are sealed**: under `remote`, at every flush (the flush then waits for the
+  upload). Under both policies, when the open segment's oldest write is `seal_interval_ms` old
+  (default 1000; one thread checks every disk every 100 ms) or the segment reaches 16 MiB. Under
+  `local` a flush does not seal, so the writes of many flushes share one PUT: 300 synchronous
+  4 KiB writes cost one PUT instead of 300 (e2e case `22_local_batching`). `seal_interval_ms: 0`
+  restores sealing at every flush.
 - **A planned move loses nothing**: unmount, `drain`, then hand the disk over.
 - **A process crash on a surviving host loses nothing.** The image and the intent map are on local
   disk; the restarted worker re-uploads every region still marked dirty, then re-attaches the device.
@@ -410,6 +417,10 @@ The torture test runs in CI with `--encrypt` as well (remote policy), and e2e ca
     test settled at 110–140 MiB instead of 50–56 MiB for three busy disks.
 - **Object-store requests**: one PUT per sealed segment and nothing when idle. Opening a disk does
   `LIST`s plus one `GET` per replayed segment.
+  - Under `local`, a busy disk makes at most about one PUT per `seal_interval_ms` plus one per
+    16 MiB written, whatever the fsync rate. At S3's $5 per million PUTs, a disk that is busy
+    around the clock costs about $0.43 a day in requests with the default 1 s interval, against
+    about $7.8 a day for the soak workload (18 fsyncs a second) when every flush sealed.
   - Under `remote`, every flush that has new data seals a segment, so the PUT count follows the
     fsync count. A fsync-heavy workload under `remote` pays one request per fsync.
 

@@ -72,6 +72,7 @@ CI runs the unit layer and the end-to-end suite on every pull request
 | `19_encryption` | with `key_file`, no object in the store contains a plaintext marker or a segment/checkpoint header; a fresh host with the key restores the tree; a wrong key and no key both fail to open the disk with a clear error; `check-config` refuses a world-readable key file |
 | `20_missing_segment` | (dir store) a committed segment in the middle of the log is deleted: a restore fails with "log incomplete" naming it instead of serving a partial disk; with the segment back, the restore works |
 | `21_lazy_crash_order` | after a lazy restore, with uploads held back by a failpoint, a write to a never-fetched block and a later write to a fetched block both survive a worker kill, and reach the store |
+| `22_local_batching` | under `local`, 300 synchronous 4 KiB writes cost a handful of PUTs (1 in practice) and reach the store within the interval without a drain; with `seal_interval_ms: 0` and under `remote` every flush seals |
 
 Failpoints (`src/failpoint.rs`) let a case make the server fail at a named place:
 

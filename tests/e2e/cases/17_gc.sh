@@ -1,6 +1,6 @@
 # Garbage collection: after many overwrites, GC rounds delete the dead segments and repack sparse
 # ones; tombstones and the restorable state survive.
-cfg=$(CKPT_EVERY=4 write_config a 1 2)
+cfg=$(CKPT_EVERY=4 SEAL_INTERVAL_MS=0 write_config a 1 2)   # a segment per sync: predictable segment counts
 start_server "$cfg"
 id=$(cfg_ids "$cfg")
 mkfs_mount "$id" "$W/m"
