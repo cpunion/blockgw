@@ -373,7 +373,7 @@ async fn handle(_q: &UblkQueue<'_>, tag: u16, d: &Arc<Dev>, io: &mut [u8]) -> i3
         libublk::sys::UBLK_IO_OP_DISCARD | libublk::sys::UBLK_IO_OP_WRITE_ZEROES => {
             let Ok(rg) = d.intent_begin(off, bytes as u64) else { return -libc::EIO };
             d.write_begin(off, bytes as u64);
-            let (r, seq) = match log::punch(d.image.as_raw_fd(), off, bytes as u64) {
+            let (r, seq) = match log::punch(d.image.as_raw_fd(), off, bytes as u64).and_then(|_| d.zero_absent(off, bytes as u64)) {
                 Ok(_) => (0, Some(d.append_discard(off, bytes))),
                 Err(_) => (-libc::EIO, None),
             };

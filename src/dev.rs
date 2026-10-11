@@ -328,6 +328,25 @@ impl Dev {
         (off / bs..(off + len).div_ceil(bs)).any(|b| !l.p.is_present(b))
     }
 
+    /// A discard over blocks that are still absent writes zeros to them instead of leaving holes, so
+    /// that after a crash an absent block that is a hole in the image can only mean "never fetched"
+    /// (see `recover`). Called between `write_begin` and `write_end`, so no fetch lands meanwhile.
+    pub fn zero_absent(&self, off: u64, len: u64) -> Result<()> {
+        if self.fully_present.load(Acquire) {
+            return Ok(());
+        }
+        let bs = crate::extmap::BLOCK;
+        let absent: Vec<u64> = {
+            let l = self.lazy.lock().unwrap();
+            (off / bs..(off + len).div_ceil(bs)).filter(|b| !l.p.is_present(*b)).collect()
+        };
+        let zeros = vec![0u8; bs as usize];
+        for b in absent {
+            self.image_buf.write_all_at(&zeros, b * bs)?;
+        }
+        Ok(())
+    }
+
     /// A write or discard to `[off, off + len)` starts / ends (lazy bookkeeping; free once complete).
     pub fn write_begin(&self, off: u64, len: u64) {
         if !self.fully_present.load(Acquire) {
@@ -591,29 +610,37 @@ impl Dev {
         for r in &regions {
             let (start, end) = (r * REGION, ((r + 1) * REGION).min(self.size));
             ranges.push(self.intent_begin(start, end - start)?);
-            if lazy {
-                // after a lazy restore an absent block's data lives only in the object store: never
-                // treat it as a hole; re-upload just the present blocks (zeros included)
-                let bs = crate::extmap::BLOCK;
-                let present: Vec<u64> = {
-                    let l = self.lazy.lock().unwrap();
-                    (start / bs..end.div_ceil(bs)).filter(|b| l.p.is_present(*b)).collect()
-                };
-                let mut blk = vec![0u8; bs as usize];
-                for b in present {
-                    rd.read_exact_at(&mut blk, b * bs)?;
-                    o.push_data(b * bs, &blk);
-                    data_bytes += bs;
-                }
-                continue;
-            }
+            // After a lazy restore the presence bitmap may be stale: it is persisted at flush, so
+            // blocks written since then can be marked absent although their data is in the image.
+            // Skipping them would upload later writes without earlier ones. Instead:
+            // - a data extent in the image is never older than the block's committed version (it
+            //   was fetched from it, or written since), so it is uploaded and becomes present;
+            // - a hole that is present is a discard (or a block that was always zero);
+            // - a hole that is absent was never fetched: discards write zeros over absent blocks
+            //   (`zero_absent`), so it cannot be a discard. Its data lives in the store; skip it.
             let mut pos = start;
             while pos < end {
                 let d = unsafe { libc::lseek(fd, pos as i64, libc::SEEK_DATA) };
                 let dstart = if d < 0 { end } else { (d as u64).min(end) };
-                if dstart > pos {
+                if dstart > pos && !lazy {
                     o.push_discard(pos, (dstart - pos) as u32);
                     holes += 1;
+                } else if dstart > pos {
+                    let bs = crate::extmap::BLOCK;
+                    let l = self.lazy.lock().unwrap();
+                    let mut b = pos / bs;
+                    while b < dstart / bs {
+                        if !l.p.is_present(b) {
+                            b += 1;
+                            continue;
+                        }
+                        let s = b;
+                        while b < dstart / bs && l.p.is_present(b) {
+                            b += 1;
+                        }
+                        o.push_discard(s * bs, ((b - s) * bs) as u32);
+                        holes += 1;
+                    }
                 }
                 if dstart >= end {
                     break;
@@ -628,10 +655,32 @@ impl Dev {
                     data_bytes += n as u64;
                     p += n as u64;
                 }
+                if lazy {
+                    let bs = crate::extmap::BLOCK;
+                    let mut l = self.lazy.lock().unwrap();
+                    for b in dstart / bs..dend.div_ceil(bs) {
+                        if !l.p.is_present(b) {
+                            l.p.filled(b);
+                            l.dirty_pages.insert((b / 8) as usize / PRESENCE_PAGE);
+                        }
+                    }
+                }
                 pos = dend;
             }
         }
         drop(o);
+        if lazy {
+            // blocks found present above: persist them (image first, so the bitmap never claims
+            // data that is not durable)
+            let snap = self.presence_snapshot();
+            rd.sync_data()?;
+            if let Some(pages) = snap {
+                self.presence_persist(pages)?;
+            }
+            if self.lazy.lock().unwrap().p.absent() == 0 {
+                self.fully_present.store(true, Release);
+            }
+        }
         let need = self.seal();
         for range in ranges {
             self.intent_end(range, Some(seq));
